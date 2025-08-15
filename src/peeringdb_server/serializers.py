@@ -81,6 +81,7 @@ from peeringdb_server.models import (
     NetworkIXLan,
     Organization,
     ParentStatusException,
+    User,
     VerificationQueueItem,
     is_suggested,
 )
@@ -277,7 +278,7 @@ class GeocodeSerializerMixin:
         if not suggested_address:
             return False
 
-        for key in ["address1", "city", "zipcode"]:
+        for key in ["address1", "zipcode"]:
             suggested_val = suggested_address.get(key, None)
             instance_val = getattr(instance, key, None)
             if instance_val != suggested_val:
@@ -291,39 +292,48 @@ class GeocodeSerializerMixin:
         update the model first
         and then normalize the geofields.
         """
-        if not ignore_geosync:
-            # Need to check if we need geosync before updating the instance
-            need_geosync = self._need_geosync(instance, validated_data)
-            instance = super().update(instance, validated_data)
+        if ignore_geosync:
+            return super().update(instance, validated_data)
 
-            # we dont want to geocode on tests
-            if settings.RELEASE_ENV == "run_tests":
-                return instance
+        # Determine if geosync is needed before updating the instance
+        need_geosync = self._need_geosync(instance, validated_data)
+        instance = super().update(instance, validated_data)
 
-            if need_geosync:
-                try:
-                    suggested_address = instance.process_geo_location()
-
-                    # normalize state if needed
-                    if suggested_address.get("state", "") != instance.state:
-                        instance.state = suggested_address.get("state", "")
-                        instance.save()
-
-                    # provide other normalization options as suggestion to the user
-                    if self.needs_address_suggestion(suggested_address, instance):
-                        self._add_meta_information(
-                            {
-                                "suggested_address": suggested_address,
-                            }
-                        )
-
-                # Reraise the model validation error
-                # as a serializer validation error
-                except ValidationError as exc:
-                    self.handle_geo_error(exc, instance)
+        # Skip geocoding during test runs
+        if settings.RELEASE_ENV == "run_tests":
             return instance
 
-        return super().update(instance, validated_data)
+        if need_geosync:
+            try:
+                suggested_address = instance.process_geo_location()
+                normalized_fields = {}
+
+                # Force Normalization fields without suggestion
+                for field in ["state", "city", "address1"]:
+                    suggested_value = suggested_address.get(field, "")
+                    if suggested_value and suggested_value != getattr(instance, field):
+                        # Store original value before normalizing
+                        normalized_fields[field] = {
+                            "original": getattr(instance, field),
+                            "normalized": suggested_value,
+                        }
+                        setattr(instance, field, suggested_value)
+
+                # If we force normalizations, save and add meta info
+                if normalized_fields:
+                    instance.save(update_fields=list(normalized_fields.keys()))
+                    self._add_meta_information(
+                        {"normalized_address": normalized_fields}
+                    )
+
+                # Provide address suggestions if necessary
+                if self.needs_address_suggestion(suggested_address, instance):
+                    self._add_meta_information({"suggested_address": suggested_address})
+
+            except ValidationError as exc:
+                self.handle_geo_error(exc, instance)
+
+        return instance
 
     def create(self, validated_data):
         # When creating a geo-enabled object,
@@ -602,16 +612,15 @@ class ExtendedURLField(serializers.URLField):
         self.validators.append(validator)
 
 
-class SaneIntegerField(serializers.IntegerField):
+class NullableIntegerField(serializers.IntegerField):
     """
-    Integer field that renders null values to 0.
+    Integer field that handles null values.
     """
 
-    def get_attribute(self, instance):
-        r = super().get_attribute(instance)
-        if r is None:
-            return 0
-        return r
+    def to_internal_value(self, data):
+        if data is None or data == "":
+            return None
+        return super().to_internal_value(data)
 
 
 class AddressSerializer(serializers.ModelSerializer):
@@ -1934,7 +1943,7 @@ class FacilitySerializer(SpatialSearchMixin, GeocodeSerializerMixin, ModelSerial
             return None
 
     def update(self, instance, validated_data):
-        instance = super().update(instance, validated_data, ignore_geosync=True)
+        instance = super().update(instance, validated_data, ignore_geosync=False)
         return instance
 
     def validate(self, data):
@@ -2597,7 +2606,7 @@ class NetworkFacilitySerializer(ModelSerializer):
 
         validators = [
             validators.UniqueTogetherValidator(
-                NetworkFacility.objects.all(), ["net_id", "fac_id", "local_asn"]
+                NetworkFacility.objects.all(), ["net_id", "fac_id"]
             )
         ]
 
@@ -2643,19 +2652,6 @@ class NetworkFacilitySerializer(ModelSerializer):
 
     def get_city(self, inst):
         return inst.facility.city
-
-    def run_validation(self, data=serializers.empty):
-        # `local_asn` will eventually be dropped from the schema
-        # for now make sure it is always a match to the related
-        # network
-
-        if data.get("net_id"):
-            try:
-                net = Network.objects.get(id=data.get("net_id"))
-                data["local_asn"] = net.asn
-            except Exception:
-                pass
-        return super().run_validation(data=data)
 
 
 class LegacyInfoTypeField(serializers.Field):
@@ -2727,11 +2723,11 @@ class NetworkSerializer(ModelSerializer):
         validators=[URLValidator(schemes=["http", "https", "telnet", "ssh"])],
     )
 
-    info_prefixes4 = SaneIntegerField(
-        allow_null=False, required=False, validators=[validate_info_prefixes4]
+    info_prefixes4 = NullableIntegerField(
+        allow_null=True, required=False, validators=[validate_info_prefixes4]
     )
-    info_prefixes6 = SaneIntegerField(
-        allow_null=False, required=False, validators=[validate_info_prefixes6]
+    info_prefixes6 = NullableIntegerField(
+        allow_null=True, required=False, validators=[validate_info_prefixes6]
     )
 
     suggest = serializers.BooleanField(required=False, write_only=True)
@@ -3173,7 +3169,6 @@ class IXLanPrefixSerializer(ModelSerializer):
         validators=[
             validators.UniqueValidator(queryset=IXLanPrefix.objects.all()),
             validate_address_space,
-            validate_prefix_overlap,
         ]
     )
     in_dfz = serializers.BooleanField(required=False, default=True)
@@ -3259,6 +3254,8 @@ class IXLanPrefixSerializer(ModelSerializer):
 
         if self.instance:
             prefix = data["prefix"]
+            if prefix:
+                validate_prefix_overlap(prefix, self.instance)
             if prefix != self.instance.prefix and not self.instance.deletable:
                 raise serializers.ValidationError(
                     {"prefix": self.instance.not_deletable_reason}
@@ -3347,6 +3344,26 @@ class IXLanSerializer(ModelSerializer):
                     "Cannot enable IX-F import without specifying the IX-F member list url"
                 )
             )
+        return data
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+
+        if isinstance(data, dict):
+            if (
+                "ixf_ixp_member_list_url" in data
+                and "ixf_ixp_member_list_url_visible" not in data
+            ):
+                # only `ixf_ixp_member_list_url` is present in the data
+                # we need to add the `ixf_ixp_member_list_url_visible` field as
+                # that is used to determine if the URL is visible to users during
+                # the final, permission aware serialization
+                try:
+                    data["ixf_ixp_member_list_url_visible"] = getattr(
+                        instance, "ixf_ixp_member_list_url_visible"
+                    )
+                except AttributeError:
+                    pass
         return data
 
 
@@ -3723,6 +3740,13 @@ class InternetExchangeSerializer(ModelSerializer):
         except ValidationError as exc:
             raise serializers.ValidationError({"policy_phone": exc.message})
 
+        try:
+            data["sales_phone"] = validate_phonenumber(
+                data["sales_phone"], data["country"]
+            )
+        except ValidationError as exc:
+            raise serializers.ValidationError({"sales_phone": exc.message})
+
         return data
 
 
@@ -3916,6 +3940,48 @@ class OrganizationSerializer(
         social_media = data.get("social_media")
         validate_social_media(social_media)
         return data
+
+
+class UserSerializer(ModelSerializer):
+    """
+    Serializer for peeringdb_server.models.User
+    """
+
+    role = serializers.ChoiceField(
+        choices=["admin", "member"],
+        required=False,
+        default="member",
+        error_messages={"invalid_choice": "Invalid role. Must be admin or member"},
+    )
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "first_name",
+            "last_name",
+            "full_name",
+            "is_active",
+            "date_joined",
+            "status",
+            "role",
+        ]
+
+    def get_user_role(self, user, organization):
+        return (
+            "admin" if user in organization.admin_usergroup.user_set.all() else "member"
+        )
+
+    def to_representation(self, instance):
+        if isinstance(instance, list):
+            return super(ModelSerializer, self).to_representation(instance)
+        else:
+            result = super(ModelSerializer, self).to_representation(instance)
+            # skip adding grainy_namespace
+            organization = self.context.get("organization")
+            if organization:
+                result["role"] = self.get_user_role(instance, organization)
+            return result
 
 
 REFTAG_MAP = {

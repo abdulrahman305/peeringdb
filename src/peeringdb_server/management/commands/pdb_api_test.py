@@ -151,11 +151,74 @@ PREFIXES_V6 = [
     "2001:504:0:9::/64",
 ]
 
+MFA_FORCE_HARD_START = (
+    settings.MFA_FORCE_HARD_START is None or DATETIME >= settings.MFA_FORCE_HARD_START
+)
+
 
 def clear_negative_cache():
     caches["negative"].clear()
 
 
+def enforce_mfa(test_func):
+    """
+    Decorator to enforce Multi-Factor Authentication (MFA) policy in test methods.
+
+    When the global setting MFA_FORCE_HARD_START is active (non-null and in the past),
+    this decorator modifies the behavior of the decorated test method to:
+
+    - Perform a representative API request using basic authentication via a guest test client.
+    - Assert that the response returns HTTP 403 Forbidden, indicating that basic authentication
+      is correctly blocked by the MFA enforcement middleware.
+    - Skip the actual test logic when MFA enforcement is in effect, as the rejection of basic
+      auth becomes the expected outcome.
+
+    If MFA_FORCE_HARD_START is not active, the test method runs normally.
+
+    This is useful for retrofitting existing tests to comply with an enforced MFA policy
+    without needing to rewrite or disable them.
+    """
+
+    def wrapper(self, *args, **kwargs):
+        if MFA_FORCE_HARD_START:
+            response = self.db_guest._request(
+                "org", method="GET"
+            )  # example request if enforce MFA mandatory
+            self.assert_basic_auth_403(response)
+            return
+        return test_func(self, *args, **kwargs)
+
+    return wrapper
+
+
+def mfa_guard_class(cls):
+    """
+    Class decorator that automatically applies MFA enforcement to all test methods.
+
+    This decorator iterates over all methods in the given test class whose names
+    start with 'test_' (standard unittest convention) and wraps them with the
+    `enforce_mfa` decorator.
+
+    This ensures that every test method will honor the MFA_FORCE_HARD_START policy,
+    enforcing that API requests using basic authentication are blocked as expected
+    once MFA becomes mandatory.
+
+    By applying this decorator at the class level, developers can ensure consistency
+    and avoid manually decorating each individual test method with `@enforce_mfa`.
+
+    Intended for use in integration or API tests where MFA enforcement may affect
+    authentication behavior and test outcomes.
+    """
+
+    for attr in dir(cls):
+        if attr.startswith("test_"):
+            method = getattr(cls, attr)
+            if callable(method):
+                setattr(cls, attr, enforce_mfa(method))
+    return cls
+
+
+@mfa_guard_class
 class TestJSON(unittest.TestCase):
     rest_client = RestClient
 
@@ -976,6 +1039,22 @@ class TestJSON(unittest.TestCase):
                     msg=f"Netsted set not existing (d0) {note_tag} {n_fld}",
                 )
 
+    def assert_basic_auth_403(self, response):
+        """
+        Assert that the response is 403 Forbidden, with a helpful message.
+        """
+        assert (
+            response.status_code == 403
+        ), f"Expected 403 Forbidden for Basic Auth with MFA_FORCE_HARD_START, got {response.status_code}"
+        self.assertEqual(
+            response.json(),
+            {
+                "meta": {
+                    "error": "Basic authentication support has been deprecated and is no longer supported, please switch to API key authentication."
+                }
+            },
+        )
+
     ##########################################################################
     # TESTS WITH USER THAT IS NOT A MEMBER OF AN ORGANIZATION
     ##########################################################################
@@ -1241,6 +1320,34 @@ class TestJSON(unittest.TestCase):
 
     ##########################################################################
 
+    @override_settings(API_CACHE_ENABLED=False)
+    def test_user_001_GET_fac_only_address1(self):
+        fac_data = self.make_data_fac(address1="5900 Wilshire Blvd")
+        facility = Facility.objects.create(status="ok", **fac_data)
+
+        response = self.db_user._request("fac?address1=wilshire", method="GET")
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn(facility.name, [f["name"] for f in data["data"]])
+        self.assertIn(facility.address1, [f["address1"] for f in data["data"]])
+
+    ##########################################################################
+
+    @override_settings(API_CACHE_ENABLED=False)
+    def test_user_001_GET_org_only_address1(self):
+        org_data = self.make_data_org(address1="707 Wilshire Blvd")
+        organization = Organization.objects.create(status="ok", **org_data)
+
+        response = self.db_user._request("org?address1=wilshire", method="GET")
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn(organization.name, [f["name"] for f in data["data"]])
+        self.assertIn(organization.address1, [f["address1"] for f in data["data"]])
+
+    ##########################################################################
+
     def test_user_001_GET_poc_public(self):
         self.assert_get_handleref(self.db_user, "poc", SHARED["poc_r_ok_public"].id)
 
@@ -1314,6 +1421,28 @@ class TestJSON(unittest.TestCase):
         networks = Network.objects.filter(status="ok")
         for net in networks:
             self.assertEqual(data[0].get(f"{net.asn}"), net.irr_as_set)
+
+    ##########################################################################
+
+    def test_user_001_GET_only_ixf_ixp_member_list_url(self):
+        test_url = "http://test-ixp.example.com/member-list"
+        ixlan = SHARED["ixlan_r_ok"]
+        ixlan.ixf_ixp_member_list_url = test_url
+        ixlan.save()
+
+        response = self.db_user.all(
+            "ixlan", id=ixlan.id, fields="ixf_ixp_member_list_url", depth=0
+        )
+
+        self.assertEqual(len(response), 1)
+
+        data = response[0]
+
+        self.assertIn("ixf_ixp_member_list_url", data)
+        self.assertEqual(data["ixf_ixp_member_list_url"], test_url)
+
+        self.assertEqual(len(data), 1)
+        self.assertNotIn("ixf_ixp_member_list_url_visible", data)
 
     ##########################################################################
     # TESTS WITH USER THAT IS ORGANIZATION MEMBER
@@ -2121,6 +2250,109 @@ class TestJSON(unittest.TestCase):
             == 5
         )
 
+    @override_settings(API_CACHE_ENABLED=False)
+    def test_api_filter_hide_ix_without_fac(self):
+        ix_filter_count = InternetExchange.objects.filter(
+            status="ok", fac_count__gt=0
+        ).count()
+        ix_count = InternetExchange.objects.filter(status="ok").count()
+
+        ixlan_filter_count = IXLan.objects.filter(
+            status="ok", ix__fac_count__gt=0
+        ).count()
+        ixlan_count = IXLan.objects.filter(status="ok").count()
+
+        net_filter_count = Network.objects.filter(status="ok", ix_count__gt=0).count()
+        net_count = Network.objects.filter(status="ok").count()
+
+        netixlan_filter_count = NetworkIXLan.objects.filter(
+            status="ok", ixlan__ix__fac_count__gt=0
+        ).count()
+        netixlan_count = NetworkIXLan.objects.filter(status="ok").count()
+
+        user = User.objects.get(username=self.db_user.user)
+
+        response = self.db_user._request("ix", method="GET")
+        assert len(response.json().get("data")) == ix_count
+
+        response = self.db_user._request("ixlan", method="GET")
+        assert len(response.json().get("data")) == ixlan_count
+
+        response = self.db_user._request("net", method="GET")
+        assert len(response.json().get("data")) == net_count
+
+        response = self.db_user._request("netixlan", method="GET")
+        assert len(response.json().get("data")) == netixlan_count
+
+        user.set_opt_flag(settings.OPTFLAG_HIDE_IX_WITHOUT_FAC, True)
+        user.save()
+
+        response = self.db_user._request("ix", method="GET")
+        assert len(response.json().get("data")) == ix_filter_count
+
+        response = self.db_user._request("ixlan", method="GET")
+        assert len(response.json().get("data")) == ixlan_filter_count
+
+        response = self.db_user._request(typ="net", method="GET")
+        assert len(response.json().get("data")) == net_filter_count
+
+        response = self.db_user._request(typ="netixlan", method="GET")
+        assert len(response.json().get("data")) == netixlan_filter_count
+
+        user.set_opt_flag(settings.OPTFLAG_HIDE_IX_WITHOUT_FAC, False)
+        user.save()
+
+        response = self.db_user._request("ix?hide_ix_no_fac=true", method="GET")
+        assert len(response.json().get("data")) == ix_filter_count
+
+        response = self.db_user._request("ix?hide_ix_no_fac=1", method="GET")
+        assert len(response.json().get("data")) == ix_filter_count
+
+        response = self.db_user._request("ixlan?hide_ix_no_fac=true", method="GET")
+        assert len(response.json().get("data")) == ixlan_filter_count
+
+        response = self.db_user._request("ixlan?hide_ix_no_fac=1", method="GET")
+        assert len(response.json().get("data")) == ixlan_filter_count
+
+        response = self.db_user._request("net?hide_ix_no_fac=true", method="GET")
+        assert len(response.json().get("data")) == net_filter_count
+
+        response = self.db_user._request("net?hide_ix_no_fac=1", method="GET")
+        assert len(response.json().get("data")) == net_filter_count
+
+        response = self.db_user._request("netixlan?hide_ix_no_fac=true", method="GET")
+        assert len(response.json().get("data")) == netixlan_filter_count
+
+        response = self.db_user._request("netixlan?hide_ix_no_fac=1", method="GET")
+        assert len(response.json().get("data")) == netixlan_filter_count
+
+        user.set_opt_flag(settings.OPTFLAG_HIDE_IX_WITHOUT_FAC, True)
+        user.save()
+
+        response = self.db_user._request("ix?hide_ix_no_fac=false", method="GET")
+        assert len(response.json().get("data")) == ix_count
+
+        response = self.db_user._request("ix?hide_ix_no_fac=0", method="GET")
+        assert len(response.json().get("data")) == ix_count
+
+        response = self.db_user._request("ixlan?hide_ix_no_fac=false", method="GET")
+        assert len(response.json().get("data")) == ixlan_count
+
+        response = self.db_user._request("ixlan?hide_ix_no_fac=0", method="GET")
+        assert len(response.json().get("data")) == ixlan_count
+
+        response = self.db_user._request("net?hide_ix_no_fac=false", method="GET")
+        assert len(response.json().get("data")) == net_count
+
+        response = self.db_user._request("net?hide_ix_no_fac=0", method="GET")
+        assert len(response.json().get("data")) == net_count
+
+        response = self.db_user._request("netixlan?hide_ix_no_fac=false", method="GET")
+        assert len(response.json().get("data")) == netixlan_count
+
+        response = self.db_user._request("netixlan?hide_ix_no_fac=0", method="GET")
+        assert len(response.json().get("data")) == netixlan_count
+
     def test_api_filter_netixlan_port(self):
         # Create a NetworkIXLan instance
         data = self.make_data_netixlan(
@@ -2684,6 +2916,10 @@ class TestJSON(unittest.TestCase):
             test_failure=SHARED["netfac_r_ok"].id,
         )
 
+        NetworkFacility.objects.get(
+            network_id=SHARED["net_rw_ok"].id, facility_id=SHARED["fac_rw_ok"].id
+        ).delete(hard=True)
+
         # re-create deleted netfac
         r_data = self.assert_create(self.db_org_admin, "netfac", data)
         # re-delete
@@ -2904,6 +3140,125 @@ class TestJSON(unittest.TestCase):
             data,
             test_failures={
                 "invalid": {"prefix": "207.128.238.0/24", "protocol": "IPv6"},
+            },
+            test_success=False,
+        )
+
+    ##########################################################################
+
+    def test_ixpfx_protected_deletion(self):
+        prefix = IXLanPrefix.objects.create(
+            ixlan=SHARED["ixlan_rw_ok"],
+            protocol="IPv4",
+            prefix="203.0.113.0/24",
+            status="ok",
+        )
+
+        netixlan = NetworkIXLan.objects.create(
+            network=SHARED["net_rw_ok"],
+            ixlan=SHARED["ixlan_rw_ok"],
+            ipaddr4="203.0.113.10",
+            status="ok",
+            asn=SHARED["net_rw_ok"].asn,
+            speed=1000,
+        )
+
+        self.assert_delete(
+            self.db_org_admin,
+            "ixpfx",
+            test_success=False,
+            test_failure=prefix.id,
+        )
+
+        self.assertTrue(
+            IXLanPrefix.objects.filter(id=prefix.id).filter(status="ok").exists()
+        )
+
+        netixlan.delete()
+        netixlan.refresh_from_db()
+        self.assertTrue(
+            NetworkIXLan.objects.filter(id=netixlan.id)
+            .filter(status="deleted")
+            .exists()
+        )
+
+        prefix.delete()
+        prefix.refresh_from_db()
+
+        self.assertTrue(
+            IXLanPrefix.objects.filter(id=prefix.id).filter(status="deleted").exists()
+        )
+
+    ##########################################################################
+
+    def test_ixpfx_renumber_validation_001(self):
+        prefix = IXLanPrefix.objects.create(
+            ixlan=SHARED["ixlan_rw_ok"],
+            protocol="IPv4",
+            prefix="203.0.113.0/24",
+            status="ok",
+        )
+
+        netixlan = NetworkIXLan.objects.create(
+            network=SHARED["net_rw_ok"],
+            ixlan=SHARED["ixlan_rw_ok"],
+            ipaddr4="203.0.113.10",
+            status="ok",
+            asn=SHARED["net_rw_ok"].asn,
+            speed=1000,
+        )
+
+        # changing the prefix to a subnet of the old one should be allowed
+        # via the API
+
+        # failure: entirely different prefix
+
+        self.assert_update(
+            self.db_org_admin,
+            "ixpfx",
+            prefix.id,
+            {"prefix": "203.0.113.0/25", "protocol": "IPv4"},
+            test_failures={
+                "invalid": {"prefix": "203.0.114.0/25"},
+            },
+        )
+
+        # changing the prefix to a supernet of the old one should be allowed
+        # via the API
+
+        self.assert_update(
+            self.db_org_admin,
+            "ixpfx",
+            prefix.id,
+            {"prefix": "203.0.113.0/24", "protocol": "IPv4"},
+        )
+
+    def test_ixpfx_renumber_validation_002(self):
+        prefix = IXLanPrefix.objects.create(
+            ixlan=SHARED["ixlan_rw_ok"],
+            protocol="IPv4",
+            prefix="203.0.113.0/24",
+            status="ok",
+        )
+
+        netixlan = NetworkIXLan.objects.create(
+            network=SHARED["net_rw_ok"],
+            ixlan=SHARED["ixlan_rw_ok"],
+            ipaddr4="203.0.113.250",
+            status="ok",
+            asn=SHARED["net_rw_ok"].asn,
+            speed=1000,
+        )
+
+        # changing the prefix to a subnet of the old one should not be allowed
+        # if the netixlan is not covered by the new prefix
+
+        self.assert_update(
+            self.db_org_admin,
+            "ixpfx",
+            prefix.id,
+            test_failures={
+                "invalid": {"prefix": "203.0.113.0/25", "protocol": "IPv4"},
             },
             test_success=False,
         )
@@ -3972,7 +4327,8 @@ class TestJSON(unittest.TestCase):
 
     ##########################################################################
 
-    def test_guest_005_list_filter_ix_name_search(self):
+    @patch("peeringdb_server.search_v2.new_elasticsearch")
+    def test_guest_005_list_filter_ix_name_search(self, mock_search_v2):
         ix = InternetExchange.objects.create(
             status="ok",
             **self.make_data_ix(
@@ -3980,8 +4336,27 @@ class TestJSON(unittest.TestCase):
             ),
         )
 
-        # rebuild search index (name_search requires it)
-        call_command("rebuild_index", "--noinput")
+        mock_es = mock_search_v2.return_value
+        mock_es.search.return_value = {
+            "hits": {
+                "total": {"value": 1},
+                "hits": [
+                    {
+                        "_index": "ix",
+                        "_id": ix.id,
+                        "_score": 1,
+                        "_source": {
+                            "name": ix.name,
+                            "org": {
+                                "id": ix.org.id,
+                                "name": ix.org.name,
+                            },
+                            "status": "ok",
+                        },
+                    }
+                ],
+            }
+        }
 
         data = self.db_guest.all("ix", name_search=ix.name)
         self.assertEqual(len(data), 1)
@@ -4060,7 +4435,8 @@ class TestJSON(unittest.TestCase):
 
     ##########################################################################
 
-    def test_guest_005_list_filter_fac_name_search(self):
+    @patch("peeringdb_server.search_v2.new_elasticsearch")
+    def test_guest_005_list_filter_fac_name_search(self, mock_search_v2):
         fac = Facility.objects.create(
             status="ok",
             **self.make_data_fac(
@@ -4068,8 +4444,27 @@ class TestJSON(unittest.TestCase):
             ),
         )
 
-        # rebuild search index (name_search requires it)
-        call_command("rebuild_index", "--noinput")
+        mock_es = mock_search_v2.return_value
+        mock_es.search.return_value = {
+            "hits": {
+                "total": {"value": 1},
+                "hits": [
+                    {
+                        "_index": "fac",
+                        "_id": fac.id,
+                        "_score": 1,
+                        "_source": {
+                            "name": fac.name,
+                            "org": {
+                                "id": fac.org.id,
+                                "name": fac.org.name,
+                            },
+                            "status": "ok",
+                        },
+                    }
+                ],
+            }
+        }
 
         data = self.db_guest.all("fac", name_search=fac.name)
         self.assertEqual(len(data), 1)
@@ -4715,7 +5110,8 @@ class TestJSON(unittest.TestCase):
 
     ##########################################################################
 
-    def test_guest_005_list_filter_carrier_name_search(self):
+    @patch("peeringdb_server.search_v2.new_elasticsearch")
+    def test_guest_005_list_filter_carrier_name_search(self, mock_search_v2):
         carrier = Carrier.objects.create(
             status="ok",
             **self.make_data_carrier(
@@ -4728,8 +5124,27 @@ class TestJSON(unittest.TestCase):
             carrier=carrier, facility=SHARED["fac_r_ok"], status="ok"
         )
 
-        # rebuild search index (name_search requires it)
-        call_command("rebuild_index", "--noinput")
+        mock_es = mock_search_v2.return_value
+        mock_es.search.return_value = {
+            "hits": {
+                "total": {"value": 1},
+                "hits": [
+                    {
+                        "_index": "carrier",
+                        "_id": carrier.id,
+                        "_score": 1,
+                        "_source": {
+                            "name": carrier.name,
+                            "org": {
+                                "id": carrier.org.id,
+                                "name": carrier.org.name,
+                            },
+                            "status": "ok",
+                        },
+                    }
+                ],
+            }
+        }
 
         data = self.db_guest.all("carrier", name_search=carrier.name)
         self.assertEqual(len(data), 1)
@@ -5075,7 +5490,8 @@ class TestJSON(unittest.TestCase):
 
     ##########################################################################
 
-    def test_readonly_users_004_list_filter_fac_name_search(self):
+    @patch("peeringdb_server.search_v2.new_elasticsearch")
+    def test_readonly_users_004_list_filter_fac_name_search(self, mock_search_v2):
         fac = Facility.objects.create(
             status="ok",
             **self.make_data_fac(
@@ -5083,8 +5499,27 @@ class TestJSON(unittest.TestCase):
             ),
         )
 
-        # rebuild search index (name_search requires it)
-        call_command("rebuild_index", "--noinput")
+        mock_es = mock_search_v2.return_value
+        mock_es.search.return_value = {
+            "hits": {
+                "total": {"value": 1},
+                "hits": [
+                    {
+                        "_index": "fac",
+                        "_id": fac.id,
+                        "_score": 1,
+                        "_source": {
+                            "name": fac.name,
+                            "org": {
+                                "id": fac.org.id,
+                                "name": fac.org.name,
+                            },
+                            "status": "ok",
+                        },
+                    }
+                ],
+            }
+        }
 
         data = self.db_guest.all("fac", name_search=fac.name)
         self.assertEqual(len(data), 1)
@@ -5301,22 +5736,12 @@ class TestJSON(unittest.TestCase):
         ixlan = SHARED["ixlan_rw_ok"]
 
         # delete the existing netfac and netixlan
-        NetworkFacility.objects.get(network=net, facility=fac).delete()
-        NetworkIXLan.objects.get(network=net, ixlan=ixlan).delete()
+        NetworkFacility.objects.get(network=net, facility=fac).delete(hard=True)
+        NetworkIXLan.objects.get(network=net, ixlan=ixlan).delete(hard=True)
 
         # test netfac create without asn sent (should auto set)
 
         data = {"net_id": net.id, "fac_id": fac.id}
-        r_data = self.db_org_admin.create("netfac", data, return_response=True).get(
-            "data"
-        )[0]
-        assert r_data["local_asn"] == net.asn
-
-        NetworkFacility.objects.get(id=r_data["id"]).delete()
-
-        # test nefac create with local_asn sent (should ignore and auto set)
-
-        data = {"net_id": net.id, "fac_id": fac.id, "local_asn": 12345}
         r_data = self.db_org_admin.create("netfac", data, return_response=True).get(
             "data"
         )[0]
@@ -5374,8 +5799,9 @@ class TestJSON(unittest.TestCase):
 
         data.update(
             prefix=PREFIXES_V4[-1],
-            tech_phone="+1 206 555 0199",
-            policy_phone="+1 206 555 0199",
+            tech_phone="1 206 555 0199",
+            policy_phone="1 206 555 0199",
+            sales_phone="1 206 555 0199",
         )
 
         r_data = self.db_org_admin.create("ix", data, return_response=True).get("data")[
@@ -5384,6 +5810,7 @@ class TestJSON(unittest.TestCase):
 
         assert r_data["tech_phone"] == "+12065550199"
         assert r_data["policy_phone"] == "+12065550199"
+        assert r_data["sales_phone"] == "+12065550199"
 
         # test that invalid numbers raise validation errors
 

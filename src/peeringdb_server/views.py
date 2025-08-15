@@ -19,6 +19,7 @@ import os
 import re
 import uuid
 from typing import Any, Union
+from urllib.parse import urlparse
 
 import django_read_only
 import googlemaps.exceptions
@@ -31,7 +32,7 @@ from django.conf import settings as dj_settings
 from django.contrib.admin.models import CHANGE, LogEntry
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
-from django.contrib.auth.models import update_last_login
+from django.contrib.auth.models import AnonymousUser, update_last_login
 from django.contrib.auth.signals import user_logged_in
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
@@ -53,8 +54,7 @@ from django.http import (
     HttpResponseRedirect,
     JsonResponse,
 )
-from django.shortcuts import redirect, render
-from django.template import loader
+from django.shortcuts import redirect
 from django.urls import Resolver404, resolve, reverse
 from django.utils import translation
 from django.utils.crypto import constant_time_compare
@@ -73,8 +73,8 @@ from django_peeringdb.const import (
     WEBSITE_OVERRIDE_HELP_TEXT,
 )
 from django_ratelimit.decorators import ratelimit
-from django_security_keys.ext.two_factor.views import (  # noqa
-    DisableView as TwoFactorDisableView,
+from django_security_keys.ext.two_factor.views import (
+    DisableView as TwoFactorDisableView,  # noqa
 )
 from django_security_keys.ext.two_factor.views import LoginView as TwoFactorLoginView
 from django_security_keys.models import SecurityKey
@@ -130,6 +130,7 @@ from peeringdb_server.models import (
     OAuthAccessTokenInfo,
     Organization,
     Partnership,
+    SearchLog,
     Sponsorship,
     User,
     UserOrgAffiliationRequest,
@@ -137,10 +138,7 @@ from peeringdb_server.models import (
 )
 from peeringdb_server.org_admin_views import load_all_user_permissions
 from peeringdb_server.permissions import APIPermissionsApplicator, check_permissions
-from peeringdb_server.search import (
-    get_lat_long_from_search_result,
-    search,
-)
+from peeringdb_server.search import get_lat_long_from_search_result, search
 from peeringdb_server.search_v2 import (
     elasticsearch_proximity_entity,
     is_valid_latitude,
@@ -160,7 +158,10 @@ from peeringdb_server.stats import get_fac_stats, get_ix_stats
 from peeringdb_server.stats import stats as global_stats
 from peeringdb_server.util import (
     generate_social_media_render_data,
+    get_template,
     objfac_tupple,
+    objfac_tupple_ui_next,
+    render,
     v2_social_media_services,
 )
 
@@ -316,12 +317,12 @@ def make_env(**data):
 
 
 def view_http_error_404(request):
-    template = loader.get_template("site/error_404.html")
+    template = get_template(request, "site/error_404.html")
     return HttpResponseNotFound(template.render(make_env(), request))
 
 
 def view_http_error_403(request):
-    template = loader.get_template("site/error_403.html")
+    template = get_template(request, "site/error_403.html")
     return HttpResponseForbidden(template.render(make_env(), request))
 
 
@@ -334,7 +335,7 @@ def view_http_error_invalid(request, reason):
 
 
 def view_maintenance(request):
-    template = loader.get_template("site/maintenance.html")
+    template = get_template(request, "site/maintenance.html")
     return HttpResponse(template.render({}, request), status=503)
 
 
@@ -377,7 +378,7 @@ def view_request_ownership(request):
                 ],
             )
 
-        template = loader.get_template("site/request-ownership.html")
+        template = get_template(request, "site/request-ownership.html")
         return HttpResponse(template.render(make_env(org=org), request))
 
     elif request.method == "POST":
@@ -632,6 +633,43 @@ def view_profile(request):
     return view_verify(request)
 
 
+@login_required
+@ensure_csrf_cookie
+def update_user_options(request):
+    if request.method == "POST":
+        user = request.user
+        hide_ix_no_fac = request.POST.get("hide_ix_no_fac") == "on"
+        user.set_opt_flag(dj_settings.OPTFLAG_HIDE_IX_WITHOUT_FAC, hide_ix_no_fac)
+        user.save()
+    return redirect("user-profile")
+
+
+@login_required
+@ensure_csrf_cookie
+def update_ui_versions(request):
+    if request.method == "POST":
+        user = request.user
+        if not user.is_authenticated:
+            return redirect("login")
+
+        selected_version = request.POST.get("ui_version")
+
+        if selected_version == "new-ui":
+            user.set_opt_flag(dj_settings.USER_OPT_FLAG_UI_NEXT, True)
+            user.set_opt_flag(dj_settings.USER_OPT_FLAG_UI_NEXT_REJECTED, False)
+
+        elif selected_version == "legacy-ui":
+            if getattr(user, "ui_next_enabled", False):
+                user.set_opt_flag(dj_settings.USER_OPT_FLAG_UI_NEXT, False)
+                user.set_opt_flag(dj_settings.USER_OPT_FLAG_UI_NEXT_REJECTED, True)
+            else:
+                user.set_opt_flag(dj_settings.USER_OPT_FLAG_UI_NEXT, False)
+                user.set_opt_flag(dj_settings.USER_OPT_FLAG_UI_NEXT_REJECTED, False)
+
+        user.save()
+    return redirect("user-profile")
+
+
 @csrf_protect
 @ensure_csrf_cookie
 @login_required
@@ -705,6 +743,7 @@ class ApplicationFormMixin:
                 "client_type",
                 "authorization_grant_type",
                 "redirect_uris",
+                "allowed_origins",
                 "algorithm",
             ),
             labels={"org": _("Organization")},
@@ -720,6 +759,32 @@ class ApplicationFormMixin:
         org_ids = [org.id for org in self.request.user.admin_organizations]
         form.fields["org"].queryset = Organization.objects.filter(id__in=org_ids)
 
+        original_clean = form.fields["allowed_origins"].clean
+
+        def validate_allowed_origins(value):
+            value = original_clean(value)
+
+            if value and value != "*":
+                origins = [origin.strip() for origin in value.split(",")]
+
+                for origin in origins:
+                    if not origin:
+                        continue
+
+                    if not origin.startswith("https://"):
+                        raise ValidationError("Origins must start with https://")
+
+                    try:
+                        parsed = urlparse(origin)
+                        if not all([parsed.scheme, parsed.netloc]):
+                            raise ValidationError(f"Invalid origin format: {origin}")
+                    except Exception:
+                        raise ValidationError(f"Invalid origin URL: {origin}")
+
+                value = ",".join(origins)
+            return value
+
+        form.fields["allowed_origins"].clean = validate_allowed_origins
         return form
 
 
@@ -849,7 +914,7 @@ def view_profile_v1(request):
 @login_required
 @require_http_methods(["GET"])
 def view_verify(request):
-    template = loader.get_template("site/verify.html")
+    template = get_template(request, "site/verify.html")
     env = BASE_ENV.copy()
     env.update(
         {"affiliations": request.user.organizations, "global_stats": global_stats()}
@@ -1230,7 +1295,7 @@ def view_password_reset(request):
                 env["username"] = pr.user.username
                 env["token_valid"] = True
 
-        template = loader.get_template("site/password-reset.html")
+        template = get_template(request, "site/password-reset.html")
 
         return HttpResponse(template.render(env, request))
 
@@ -1301,7 +1366,7 @@ def view_registration(request):
         )
 
     if request.method in ["GET", "HEAD"]:
-        template = loader.get_template("site/register.html")
+        template = get_template(request, "site/register.html")
         env = BASE_ENV.copy()
         env.update(
             {"global_stats": global_stats(), "register_form": UserCreationForm()}
@@ -1397,7 +1462,7 @@ def view_index(request, errors=None):
     if not errors:
         errors = []
 
-    template = loader.get_template("site/index.html")
+    template = get_template(request, "site/index.html")
 
     if request.user.is_authenticated:
         organizations_require_2fa = any(
@@ -1432,24 +1497,52 @@ def view_component(
     if not perms:
         perms = {}
 
-    template = loader.get_template("site/view.html")
+    user = request.user
+    use_next_ui = user.is_authenticated and getattr(user, "ui_next_enabled", False)
+
+    if use_next_ui:
+        base_template_path = "site_next"
+    else:
+        base_template_path = "site"
+
+    template = get_template(request, f"{base_template_path}/view.html")
 
     env = BASE_ENV.copy()
     env.update(
         {
             "data": data,
+            "email": dj_settings.DEFAULT_FROM_EMAIL,
             "permissions": perms,
             "title": title,
             "component": component,
             "instance": instance,
             "ref_tag": instance._handleref.tag,
             "global_stats": global_stats(),
-            "asset_template_name": "site/view_%s_assets.html" % component,
-            "tools_template_name": "site/view_%s_tools.html" % component,
-            "side_template_name": "site/view_%s_side.html" % component,
-            "bottom_template_name": "site/view_%s_bottom.html" % component,
+            "asset_template_name": f"{base_template_path}/view_{component}_assets.html",
+            "tools_template_name": f"{base_template_path}/view_{component}_tools.html",
+            "side_template_name": f"{base_template_path}/view_{component}_side.html",
+            "bottom_template_name": f"{base_template_path}/view_{component}_bottom.html",
         }
     )
+
+    if component == "campus":
+        env.update(
+            {
+                "facilities_template_name": f"{base_template_path}/view_{component}_facilities.html",
+                "carriers_template_name": f"{base_template_path}/view_{component}_carriers.html",
+                "exchanges_template_name": f"{base_template_path}/view_{component}_exchanges.html",
+                "networks_template_name": f"{base_template_path}/view_{component}_networks.html",
+            }
+        )
+    else:
+        env.update(
+            {
+                "asset_template_name": f"{base_template_path}/view_{component}_assets.html",
+                "tools_template_name": f"{base_template_path}/view_{component}_tools.html",
+                "side_template_name": f"{base_template_path}/view_{component}_side.html",
+                "bottom_template_name": f"{base_template_path}/view_{component}_bottom.html",
+            }
+        )
 
     update_env_settings(env)
 
@@ -1995,8 +2088,64 @@ def view_facility(request, id):
     data = generate_social_media_render_data(data, social_media, 3, dismiss)
 
     data["stats"] = get_fac_stats(peers, exchanges)
+
+    user_networks = []
+    user_exchanges = []
+    user_carriers = []
+    if not isinstance(request.user, AnonymousUser):
+        existing_network_ids = set(
+            NetworkFacility.handleref.undeleted()
+            .filter(facility=facility)
+            .values_list("network_id", flat=True)
+        )
+        existing_exchange_ids = set(
+            InternetExchangeFacility.handleref.undeleted()
+            .filter(facility=facility)
+            .values_list("ix_id", flat=True)
+        )
+        existing_carrier_ids = set(
+            CarrierFacility.handleref.undeleted()
+            .filter(facility=facility)
+            .values_list("carrier_id", flat=True)
+        )
+
+        for network in request.user.networks:
+            # Check if user can manage network and network is not already connected to facility
+            if (
+                check_permissions(request.user, network, PERM_CREATE)
+                and check_permissions(request.user, network, PERM_UPDATE)
+                and check_permissions(request.user, network, PERM_DELETE)
+            ) and network.id not in existing_network_ids:
+                user_networks.append({"id": network.id, "name": network.name})
+
+        for ix in request.user.exchanges:
+            # Check if user can manage ix and ix is not already connected to facility
+            if (
+                check_permissions(request.user, ix, PERM_CREATE)
+                and check_permissions(request.user, ix, PERM_UPDATE)
+                and check_permissions(request.user, ix, PERM_DELETE)
+            ) and ix.id not in existing_exchange_ids:
+                user_exchanges.append({"id": ix.id, "name": ix.name})
+
+        for carrier in request.user.carriers:
+            # Check if user can update carrier and carrier is not already connected to facility
+            if (
+                check_permissions(request.user, carrier, PERM_CREATE)
+                and check_permissions(request.user, carrier, PERM_UPDATE)
+                and check_permissions(request.user, carrier, PERM_DELETE)
+            ) and carrier.id not in existing_carrier_ids:
+                user_carriers.append({"id": carrier.id, "name": carrier.name})
+
     return view_component(
-        request, "facility", data, "Facility", perms=perms, instance=facility
+        request,
+        "facility",
+        data,
+        "Facility",
+        perms=perms,
+        instance=facility,
+        user_networks=user_networks,
+        user_exchanges=user_exchanges,
+        user_carriers=user_carriers,
     )
 
 
@@ -2138,9 +2287,18 @@ def view_campus(request, id):
         ixfac = ixfac.union(facility.ixfac_set_active, all=False)
         netfac = netfac.union(facility.netfac_set_active, all=False)
         carrierfac = carrierfac.union(facility.carrierfac_set_active, all=False)
-    carriers = objfac_tupple(carrierfac, "carrier")
-    networks = objfac_tupple(netfac, "network")
-    exchanges = objfac_tupple(ixfac, "ix")
+
+    user = request.user
+    use_next_ui = user.is_authenticated and getattr(user, "ui_next_enabled", False)
+
+    if use_next_ui:
+        carriers = objfac_tupple_ui_next(carrierfac, "carrier", "mixed")
+        networks = objfac_tupple_ui_next(netfac, "network", "grouped")
+        exchanges = objfac_tupple_ui_next(ixfac, "ix", "grouped")
+    else:
+        carriers = objfac_tupple(carrierfac, "carrier")
+        networks = objfac_tupple(netfac, "network")
+        exchanges = objfac_tupple(ixfac, "ix")
     org = data.get("org")
 
     social_media = data.get("social_media")
@@ -2492,8 +2650,27 @@ def view_exchange(request, id):
 
     data["stats"] = get_ix_stats(networks, ixlan)
 
+    user_networks = []
+    if not isinstance(request.user, AnonymousUser):
+        for network in request.user.networks:
+            # Check if user can update network
+            if (
+                check_permissions(request.user, network, PERM_CREATE)
+                and check_permissions(request.user, network, PERM_UPDATE)
+                and check_permissions(request.user, network, PERM_DELETE)
+            ):
+                user_networks.append(
+                    {"id": network.id, "name": network.name, "asn": network.asn}
+                )
+
     return view_component(
-        request, "exchange", data, "Exchange", perms=perms, instance=exchange
+        request,
+        "exchange",
+        data,
+        "Exchange",
+        perms=perms,
+        instance=exchange,
+        user_networks=user_networks,
     )
 
 
@@ -2602,6 +2779,10 @@ def view_network(request, id):
         .filter(network=network)
         .order_by("ixlan__ix__name")
     )
+    if not isinstance(request.user, AnonymousUser) and getattr(
+        request.user, "hide_ixs_without_fac", False
+    ):
+        exchanges = exchanges.filter(ixlan__ix__fac_count__gt=0)
 
     # This will be passed as default value for keys that don't exist - causing
     # them not to be rendered in the template - also it is fairly
@@ -2713,19 +2894,33 @@ def view_network(request, id):
                 "name": "info_prefixes4",
                 "label": _("IPv4 Prefixes"),
                 "type": "number",
-                "help_text": field_help(Network, "info_prefixes4"),
+                "help_text": _(
+                    "Recommended maximum number of IPv4 "
+                    "routes/prefixes to be configured on peering "
+                    "sessions for this ASN.\n"
+                    "Leave blank for not disclosed."
+                ),
                 "notify_incomplete": True,
                 "notify_incomplete_group": "prefixes",
-                "value": int(network_d.get("info_prefixes4") or 0),
+                "value": int(network_d.get("info_prefixes4"))
+                if network_d.get("info_prefixes4") is not None
+                else "",
             },
             {
                 "name": "info_prefixes6",
                 "label": _("IPv6 Prefixes"),
                 "type": "number",
-                "help_text": field_help(Network, "info_prefixes6"),
+                "help_text": _(
+                    "Recommended maximum number of IPv6 "
+                    "routes/prefixes to be configured on peering "
+                    "sessions for this ASN.\n"
+                    "Leave blank for not disclosed."
+                ),
                 "notify_incomplete": True,
                 "notify_incomplete_group": "prefixes",
-                "value": int(network_d.get("info_prefixes6") or 0),
+                "value": int(network_d.get("info_prefixes6"))
+                if network_d.get("info_prefixes6") is not None
+                else "",
             },
             {
                 "name": "info_traffic",
@@ -2938,7 +3133,7 @@ def view_suggest(request, reftag):
     if reftag not in ["net", "ix", "fac"]:
         return HttpResponseRedirect("/")
 
-    template = loader.get_template(f"site/view_suggest_{reftag}.html")
+    template = get_template(request, f"site/view_suggest_{reftag}.html")
     env = make_env()
 
     env["phone_help_text"] = field_help(NetworkContact, "phone")
@@ -2952,7 +3147,7 @@ def view_simple_content(request, content_name):
     the peeringdb layout.
     """
 
-    template = loader.get_template("site/simple_content.html")
+    template = get_template(request, "site/simple_content.html")
 
     env = make_env(content_name=content_name)
 
@@ -2980,7 +3175,7 @@ def view_sponsorships(request):
     View current sponsorships.
     """
 
-    template = loader.get_template("site/sponsorships.html")
+    template = get_template(request, "site/sponsorships.html")
     now = datetime.datetime.now().replace(tzinfo=UTC())
 
     qset = Sponsorship.objects.filter(start_date__lte=now, end_date__gte=now)
@@ -3001,7 +3196,7 @@ def view_partnerships(request):
     View current partners.
     """
 
-    template = loader.get_template("site/partnerships.html")
+    template = get_template(request, "site/partnerships.html")
     qset = Partnership.objects.filter(logo__isnull=False)
 
     partnerships = {}
@@ -3021,7 +3216,7 @@ def view_advanced_search(request):
     View for advanced search.
     """
 
-    template = loader.get_template("site/advanced-search.html")
+    template = get_template(request, "site/advanced-search.html")
     env = make_env(row_limit=getattr(dj_settings, "API_DEPTH_ROW_LIMIT", 250))
 
     reftag = request.GET.get("reftag")
@@ -3061,6 +3256,29 @@ def view_advanced_search(request):
 
     env["campus_help_text"] = CAMPUS_HELP_TEXT
 
+    params = request.GET
+    is_spatial_search = False
+    is_location_search = False
+    country_filter = params.get("country__in")
+
+    if (
+        params.get("state")
+        or (params.get("zipcode"))
+        or (params.get("address1"))
+        or (params.get("city"))
+        or country_filter
+    ):
+        is_location_search = True
+
+    if params.get("distance") or (params.get("city")):
+        is_spatial_search = True
+
+    env["is_spatial_search"] = is_spatial_search
+    env["is_location_search"] = is_location_search
+    env["country_filter"] = country_filter
+
+    env["asn_connectivity_limit"] = getattr(dj_settings, "ASN_CONNECTIVITY_LIMIT")
+
     return HttpResponse(template.render(env, request))
 
 
@@ -3075,7 +3293,7 @@ def request_api_search(request):
     if not q:
         return HttpResponseBadRequest()
 
-    result = search(q, autocomplete=True)
+    result = search(q, autocomplete=True, user=request.user)
 
     campus_facilites = {
         fac.id: fac for fac in Facility.objects.exclude(campus_id__isnull=True)
@@ -3103,6 +3321,14 @@ def render_search_result(request, version: int = 2) -> HttpResponse:
     # Extract and process the query
     q, geo, original_query = extract_query(request, version)
 
+    SearchLog.objects.create(
+        query=original_query,
+        authenticated=request.user.is_authenticated
+        if getattr(request, "user", None)
+        else False,
+        version=version,
+    )
+
     # Redirect if no valid query
     if not q and not geo:
         return HttpResponseRedirect("/")
@@ -3113,11 +3339,13 @@ def render_search_result(request, version: int = 2) -> HttpResponse:
         return asn_redirect
 
     # Perform the search based on the query and version
-    result = perform_search(q, geo, version, original_query)
+    result = perform_search(
+        q, geo, version, original_query, request.user if version == 2 else None
+    )
 
     # Build the environment for rendering the template
     env = build_template_environment(result, geo, version, request, q)
-    template = loader.get_template("site/search_result.html")
+    template = get_template(request, "site/search_result.html")
 
     return HttpResponse(template.render(env, request))
 
@@ -3172,7 +3400,11 @@ def handle_asn_query(q: list[str], version: int) -> HttpResponseRedirect | None:
 
 
 def perform_search(
-    q: list[str], geo: dict[str, Union[str, float]], version: int, original_query: str
+    q: list[str],
+    geo: dict[str, Union[str, float]],
+    version: int,
+    original_query: str,
+    user,
 ) -> dict:
     """
     Executes the search based on the query and version.
@@ -3188,7 +3420,7 @@ def perform_search(
     """
     if original_query:
         if version == 2:
-            return search_v2(q, geo)
+            return search_v2(q, geo, user)
         else:
             return search(q)
     return {}
@@ -3703,7 +3935,8 @@ class LoginView(TwoFactorLoginView):
         credential = request.POST.get("credential", None)
 
         if credential and response:
-            request.used_passkey_auth = True
+            request.session["used_passkey_auth"] = True
+            request.session.save()
 
         return response
 
@@ -3855,16 +4088,18 @@ class LoginView(TwoFactorLoginView):
     def set_amr(self):
         amr = []
         done_forms = self.get_done_form_list()
-        passkey = getattr(self, "used_passkey_auth", False)
-
+        passkey = self.request.session.get("used_passkey_auth", False)
         if not passkey:
             amr.append("pwd")
         else:
             amr.append("swk")
 
+        # Check if token step was actually completed by the user by looking for the OTP token in the data
         if "token" in done_forms:
-            # user used OTP to login
-            amr.append("otp")
+            token_data = self.storage.get_step_data("token")
+            # Only add "otp" to amr if the user actually entered a token
+            if token_data and token_data.get("token-otp_token"):
+                amr.append("otp")
 
         if "security-key" in done_forms:
             # user used a security key to login

@@ -12,6 +12,7 @@ A substantial part of the import logic is handled through models.py::IXFMemberDa
 import datetime
 import ipaddress
 import json
+import re
 from smtplib import SMTPException
 
 import django
@@ -67,14 +68,35 @@ class MultipleVlansInPrefix(ValueError):
     is not a compatible setup for import (see #889).
     """
 
-    def __init__(self, importer, *args, **kwargs):
+    def __init__(self, importer, conflict_info, *args, **kwargs):
         importer.ixlan.ixf_ixp_member_list_url
         importer.ixlan.ix.name
         support_email = settings.DEFAULT_FROM_EMAIL
+        self.conflict_info = conflict_info
+        first_vlan = conflict_info["first_vlan"]
+        conflicting_vlan = conflict_info["conflicting_vlan"]
+        asn = conflict_info.get("asn", "Unknown")
+        path = conflict_info.get("path", "Unknown")
+
+        vlan_obj = conflict_info.get("vlan_obj", {})
+        vlan_obj_str = json.dumps(vlan_obj, indent=2) if vlan_obj else ""
+
+        detail_msg = (
+            f"\nError occurred at {path}"
+            f"\n"
+            f"\nASN: {asn}"
+            f"\nFirst VLAN ID: {first_vlan}"
+            f"\nConflicting VLAN ID: {conflicting_vlan}"
+        )
+
+        if vlan_obj_str:
+            detail_msg += f"\n\nConflicting VLAN object:\n```\n{vlan_obj_str}\n```"
+
         super().__init__(
             _(
                 f"We found that your IX-F output "
                 f"contained multiple VLANs for the prefixes defined in the PeeringDB entry for your exchange."
+                f"{detail_msg}"
                 "\n"
                 f"This setup is not compatible as PeeringDB regards each VLAN as its own exchange."
                 "\n"
@@ -153,6 +175,8 @@ class Importer:
     def __init__(self):
         self.cache_only = False
         self.skip_import = False
+        # For MultipleVlansInPrefix Error
+        self.current_path = {"member": None, "connection": None, "vlan": None}
         self.reset()
 
     def reset(self, ixlan=None, save=False, asn=None):
@@ -509,22 +533,28 @@ class Importer:
             - asn (int): only process changes for this ASN
 
         Returns:
-            - Tuple(success<bool>, netixlans<list>, log<list>)
+            - success (bool)
         """
 
         self.reset(ixlan=ixlan, save=save, asn=asn)
 
         # if data is not provided, retrieve it either from cache or
         # from the remote resource
-        if data is None:
-            if self.cache_only:
-                data = self.fetch_cached(ixlan.ixf_ixp_member_list_url)
-            else:
-                data = self.fetch(ixlan.ixf_ixp_member_list_url, timeout=timeout)
+        try:
+            if data is None:
+                if self.cache_only:
+                    data = self.fetch_cached(ixlan.ixf_ixp_member_list_url)
+                else:
+                    data = self.fetch(ixlan.ixf_ixp_member_list_url, timeout=timeout)
+        except Exception as exc:
+            # any errors happening during retrieval and sanitization are fatal
+            # and will be logged and the import will be aborted
+            self.log_error(f"Internal Error: {exc}", save=save)
+            return False
 
         # bail if there has been any errors during sanitize() or fetch()
         if data.get("pdb_error"):
-            self.notify_error(data.get("pdb_error"))
+            self.notify_error(data.get("pdb_error"), data.get("schema_email", False))
             self.log_error(data.get("pdb_error"), save=save)
             return False
 
@@ -547,14 +577,13 @@ class Importer:
             # other queued notifications
             #
             # transactions are atomic and will be rolled back
-            self.notify_error(f"{exc}")
+            self.notify_error(f"{exc}", data.get("schema_email", False))
             self.log_error(f"{exc}", save=save)
             self.notifications = []
             return False
-        except KeyError as exc:
-            # any key erros mean that the data is invalid, log the error and
-            # bail (transactions are atomic and will be rolled back)
-            self.log_error(f"Internal Error 'KeyError': {exc}", save=save)
+        except Exception as exc:
+            # any errors when parsing the data are fatal and will be logged and the import will be aborted
+            self.log_error(f"Internal Error: {exc}", save=save)
             return False
 
         # null IX-F error note on ixlan if it had error'd before
@@ -590,7 +619,9 @@ class Importer:
         self.archive()
 
         if self.invalid_ip_errors:
-            self.notify_error("\n".join(self.invalid_ip_errors))
+            self.notify_error(
+                "\n".join(self.invalid_ip_errors), data.get("schema_email", False)
+            )
 
         if save:
             # update exchange's ixf fields
@@ -835,7 +866,12 @@ class Importer:
         Arguments:
             - member_list <list>
         """
-        for member in member_list:
+        for member_index, member in enumerate(member_list):
+            # Update current path for member
+            self.current_path["member"] = member_index
+            self.current_path["connection"] = None
+            self.current_path["vlan"] = None
+
             asn = member["asnum"]
 
             # if we are only processing a specific asn, ignore all
@@ -874,7 +910,11 @@ class Importer:
         """
 
         asn = member["asnum"]
-        for connection in connection_list:
+        for connection_index, connection in enumerate(connection_list):
+            # Update current path for connection
+            self.current_path["connection"] = connection_index
+            self.current_path["vlan"] = None
+
             self.connection_errors = {}
             state = connection.get("state", "active").lower()
             if state in self.allowed_states:
@@ -901,7 +941,10 @@ class Importer:
         """
 
         asn = member["asnum"]
-        for lan in vlan_list:
+        for vlan_index, lan in enumerate(vlan_list):
+            # Update current path for vlan
+            self.current_path["vlan"] = vlan_index
+
             ipv4 = lan.get("ipv4", {})
             ipv6 = lan.get("ipv6", {})
 
@@ -986,7 +1029,18 @@ class Importer:
                 # prefixes spread over multiple vlans and
                 # cannot be represented properly at one ixlan
                 # fail the import
-                raise MultipleVlansInPrefix(self)
+                path = f"data.member_list[{self.current_path['member']}]"
+                path += f".connection_list[{self.current_path['connection']}]"
+                path += f".vlan_list[{self.current_path['vlan']}]"
+
+                conflict_info = {
+                    "first_vlan": self.vlan,
+                    "conflicting_vlan": vlan,
+                    "asn": asn,
+                    "path": path,
+                    "vlan_obj": lan,
+                }
+                raise MultipleVlansInPrefix(self, conflict_info)
 
             self.vlan = vlan
 
@@ -2108,7 +2162,7 @@ class Importer:
 
     @reversion.create_revision()
     @transaction.atomic()
-    def notify_error(self, error):
+    def notify_error(self, error, schema_email=False):
         """
         Notifie the exchange and AC of any errors that
         were encountered when the IX-F data was
@@ -2122,15 +2176,37 @@ class Importer:
 
         now = datetime.datetime.now(datetime.timezone.utc)
         notified = self.ixlan.ixf_ixp_import_error_notified
-        self.ixlan.ixf_ixp_import_error
+        previous_error = self.ixlan.ixf_ixp_import_error
 
-        if notified:
-            diff = (now - notified).total_seconds() / 3600
-            if diff < settings.IXF_PARSE_ERROR_NOTIFICATION_PERIOD:
-                return
+        if error is None:
+            error_type = "Unknown"
+            error_message = "No error details available"
+        elif isinstance(error, str):
+            error_type = "Error"
+            error_message = error
+        else:
+            error_type = error.__class__.__name__
+            error_message = str(error)
+
+        standardized_error = f"{error_type}: {error_message}"
+
+        def are_errors_equivalent(error1, error2):
+            """Compare two error messages that has memory addresses, ignoring memory addresses."""
+            if not error1 or not error2:
+                return False
+
+            norm1 = re.sub(r"object at 0x[0-9a-f]+", "object at <ADDR>", error1)
+            norm2 = re.sub(r"object at 0x[0-9a-f]+", "object at <ADDR>", error2)
+            return norm1 == norm2
+
+        if previous_error and are_errors_equivalent(previous_error, standardized_error):
+            if notified:
+                diff = (now - notified).total_seconds() / 3600
+                if diff < settings.IXF_PARSE_ERROR_NOTIFICATION_PERIOD:
+                    return
 
         self.ixlan.ixf_ixp_import_error_notified = now
-        self.ixlan.ixf_ixp_import_error = error
+        self.ixlan.ixf_ixp_import_error = standardized_error
         self.ixlan.save()
 
         ixf_member_data = IXFMemberData(ixlan=self.ixlan, asn=0)
@@ -2146,7 +2222,10 @@ class Importer:
         # AC does not want ticket here as per #794
         # self._ticket(ixf_member_data, subject, message)
 
-        if ixf_member_data.ix_contacts:
+        if schema_email:
+            schema_recipients = [schema_email]
+            self._email(subject, message, schema_recipients, ix=ixf_member_data.ix)
+        elif ixf_member_data.ix_contacts:
             self._email(
                 subject, message, ixf_member_data.ix_contacts, ix=ixf_member_data.ix
             )

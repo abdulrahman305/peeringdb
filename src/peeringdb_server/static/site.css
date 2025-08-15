@@ -15,6 +15,13 @@ html, body {
   transition: background-color 0.3s, color 0.3s;
 }
 
+/* Scrollbar color for firefox */
+@-moz-document url-prefix() {
+  * {
+    scrollbar-color: #999 transparent !important;
+  }
+}
+
 body {
   background-color: var(--tertiary-bg-color);
   overflow-y: scroll;
@@ -564,7 +571,10 @@ div.view_info .theme-container h3{
   text-align: center;
 }
 
-div.view_info .theme-container .btn-outline-dark.active{
+div.view_info .theme-container .btn-outline-dark.active,
+#ui-next-rejected.btn-outline-dark.active,
+#ui-next-enabled.btn-outline-dark.active
+{
   background-color: var(--button-hover-color) !important;
 }
 
@@ -1617,28 +1627,28 @@ a.sponsor {
 a.sponsor.diamond {
   background-color: #00aca1;
   border-color: #00aca1;
-  color: var(--button-text-color-1);
+  color: #ffffff !important;
   content: 'Diamond Sponsor';
 }
 
 a.sponsor.platinum {
   background-color: #899a9d;
   border-color: #899a9d;
-  color: var(--button-text-color-1);
+  color:  #ffffff !important;
   content: 'Platinum Sponsor';
 }
 
 a.sponsor.gold {
   background-color: #e3a631;
   border-color: #e3a631;
-  color: var(--button-text-color-1);
+  color:  #ffffff !important;
   content: 'Gold Sponsor';
 }
 
 a.sponsor.silver {
   border-color: #626a75;
   background-color: #626a75;
-  color: var(--button-text-color-1);
+  color:  #ffffff !important;
   content: 'Silver Sponsor';
 }
 
@@ -1651,10 +1661,19 @@ span.inline.delimited input {
   margin-bottom: 10px;
 }
 
+.ip4,
+div[name=ipaddr4],
+div[data-edit-name=ipaddr4] {
+  word-break: break-all;
+  white-space: normal !important;
+}
+
 .ip6,
 div[name=ipaddr6],
-div[data-edit-name=ipaddr6]
-{ word-break: break-all; }
+div[data-edit-name=ipaddr6] {
+  word-break: break-all;
+  white-space: normal !important;
+}
 
 .ixf-log {
   max-height: 400px;
@@ -1895,4 +1914,62 @@ input.input-block-level {
 }
 .show-on-edit{
   display: none !important;
+}
+
+.code-container {
+  width: 100%;
+  margin: 1rem 0;
+}
+
+.code-container pre {
+  margin: 0;
+  background-color: var(--secondary-bg-color);
+}
+
+.code-content {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+}
+
+.code-container code {
+  flex: 1;
+  display: block;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  word-break: break-word;
+}
+
+.code-actions {
+  display: flex;
+  margin: -5px -5px 0 0;
+}
+
+.copy-btn {
+  border: none;
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  opacity: 0.8;
+  transition: all 0.2s;
+  padding: 0;
+  background-color: var(--secondary-bg-color);
+}
+
+.copy-btn:hover {
+  opacity: 1;
+  background-color: var(--button-hover-color);
+}
+
+.copy-btn .material-icons {
+  font-size: 18px;
+  color: var(--heading-color);
+}
+
+/* Highlight rows that contain two or more ASNs in ASN Connectivity table */
+div.advanced-search-view div.results div.row.row-hilight {
+  background-color: var(--alert-info-bg);
 }

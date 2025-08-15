@@ -47,23 +47,35 @@ PeeringDB = {
    * @returns {object} The jQuery node for the rendered link.
    */
   social_media_link: function(identifier, service) {
-    if (service === "website") {
-      return $('<a/>').attr('href', identifier).text(identifier);
-    }
-    if (service === "facebook") {
-      return $('<a/>').attr('href', 'https://www.facebook.com/' + identifier).text(identifier);
-    }
-    if (service === "x") {
-      return $('<a/>').attr('href', 'https://x.com/' + identifier).text(identifier);
-    }
-    if (service === "instagram") {
-      return $('<a/>').attr('href', 'https://www.instagram.com/' + identifier).text(identifier);
-    }
-    if (service === "linkedin") {
-      return $('<a/>').attr('href', 'https://www.linkedin.com/company/' + identifier).text(identifier);
-    }
-    if (service === "tiktok") {
-      return $('<a/>').attr('href', 'https://www.tiktok.com/@' + identifier).text(identifier);
+    const formats = {
+      "website": null,
+      "facebook": "https://www.facebook.com/{identifier}",
+      "x": "https://x.com/{identifier}",
+      "instagram": "https://www.instagram.com/{identifier}",
+      "linkedin": "https://www.linkedin.com/company/{identifier}",
+      "tiktok": "https://www.tiktok.com/@{identifier}",
+      "bluesky": "https://bsky.app/profile/{identifier}",
+      "threads": "https://www.threads.net/@{identifier}",
+      "youtube": "https://www.youtube.com/@{identifier}",
+      "mastodon": null,
+      "whatsapp": "https://wa.me/{identifier}",
+      "wechat": null,
+      "telegram": "https://t.me/{identifier}",
+      "snapchat": "https://www.snapchat.com/add/{identifier}",
+      "douyin": "https://www.douyin.com/user/{identifier}",
+      "kuaishou": "https://www.kuaishou.com/profile/{identifier}",
+      "reddit": "https://www.reddit.com/user/{identifier}",
+      "weibo": "https://weibo.com/{identifier}",
+      "qq": null,
+      "pinterest": "https://www.pinterest.com/{identifier}"
+    };
+
+    const format = formats[service];
+    if (format) {
+      const url = format.replace('{identifier}', identifier);
+      return $('<a/>').attr('href', url).attr('target', '_blank').text(identifier);
+    } else if (identifier.startsWith("https://")) {
+      return $('<a/>').attr('href', identifier).attr('target', '_blank').text(identifier);
     }
 
     return $('<span/>').text(identifier);
@@ -270,6 +282,37 @@ PeeringDB = {
     popin.removeClass("hidden").show();
    },
 
+
+   add_normalized_address : function(meta, endpoint) {
+    let popin = $('.normalized-address').filter(function() {
+        return $(this).data("edit-geotag") == endpoint
+    });
+
+    if (popin.length === 0) {
+        return;
+    }
+
+    let normalized_address = meta.normalized_address;
+    let addressHTML = "";
+
+    // Create list of normalized fields showing original → normalized
+    for (const [field, values] of Object.entries(normalized_address)) {
+        let fieldName = field.charAt(0).toUpperCase() + field.slice(1);
+        addressHTML += `<div><strong>${fieldName}:</strong> ${values.original} → <strong>${values.normalized}</strong></div>`;
+    }
+
+    // Fill in the changes to the notification
+    popin.find('.normalized-fields').html(addressHTML);
+
+    // Initialize the acknowledge button
+    let acknowledge_button = popin.find("a.btn.normalization-acknowledge");
+    acknowledge_button.click(() => popin.addClass("hidden").hide());
+
+    // Show the popin
+    popin.removeClass("hidden").show();
+
+  },
+
   // initializes the "Accept suggestion" button
 
   init_accept_suggestion : function(button, response, endpoint){
@@ -277,14 +320,6 @@ PeeringDB = {
     let payload = response.data[0];
     // Overwrite returned instance with the suggested data
     Object.assign(payload, response.meta.suggested_address);
-
-    // No need to have latitude or longitude
-    // in the payload since it will get
-    // geocoded again
-
-    delete payload.latitude;
-    delete payload.longitude;
-
 
     // Set up PUT request on click
     button.click(function(event){
@@ -441,6 +476,7 @@ PeeringDB.ViewTools = {
     if(target == "api:ix:update") {
       this.apply_data(container, data, "tech_phone");
       this.apply_data(container, data, "policy_phone");
+      this.apply_data(container, data, "sales_phone");
     }
     if (target === "api:fac:update" || target === "api:org:update") {
       addressFields.forEach(field => this.apply_data(container, data, field));
@@ -1928,11 +1964,36 @@ twentyc.editable.module.register(
       return row
     },
 
-    execute_update : function(trigger, container) {
+    execute_update: function(trigger, container) {
       var row = this.row(trigger);
-      row.editable("export", this.target.data);
-      this.target.execute("update", trigger, function(response) {
-      }.bind(this));
+
+      var currentKeyMode = row.find('[data-edit-name="passkey_login"]');
+      var currentStatus = currentKeyMode.text().trim();
+      var isAllowedLogin = currentStatus === "Allow login";
+
+      this.target.data = {
+          id: row.data("edit-id"),
+          passkey_login: !isAllowedLogin
+      };
+
+      this.target.execute("update-security-key", this.components.add, (response) => {
+          if (response.status === "ok") {
+              if (response.passkey_login) {
+                currentKeyMode.text("Allow login");
+                trigger.text("Disallow login");
+              } else {
+                currentKeyMode.text("Disallow login");
+                trigger.text("Allow login");
+              }
+          } else {
+              $("#errors-alert").html(`<div class="alert alert-danger">Update failed</div>`);
+          }
+          container.editable("loading-shim", "hide");
+      }, (error) => {
+          $("#errors-alert").html(`<div class="alert alert-danger">Update failed: ${error}</div>`);
+          container.editable("loading-shim", "hide");
+          console.error(error);
+      });
     },
 
     execute_remove : function(trigger, container) {
@@ -2245,7 +2306,14 @@ twentyc.editable.target.register(
                 if(fld.data("sort-target")) {
                   sortValue = d[fld.data("sort-target")];
                 }
-                fld.data("sort-value", typeof sortValue == "string" ? sortValue.toLowerCase() : sortValue);
+
+                // Handle boolean values for proper sorting
+                if (typeof sortValue === "boolean") {
+                  fld.data("sort-value", sortValue ? 1 : 0);
+                } else {
+                  fld.data("sort-value", typeof sortValue == "string" ? sortValue.toLowerCase() : sortValue);
+                }
+
                 fld.html(value);
                 if(this.tagName == "A") {
                   fld.attr("href", fld.attr("href").replace("$id", d.id));
@@ -2395,6 +2463,8 @@ twentyc.editable.target.register(
           PeeringDB.add_geo_warning(r.meta, endpoint);
         } else if (r && r.meta && r.meta.suggested_address){
           PeeringDB.add_suggested_address(r, endpoint);
+        } else if (r && r.meta && r.meta.normalized_address) {
+          PeeringDB.add_normalized_address(r.meta, endpoint);
         }
 
       }).fail(function(r) {
@@ -2792,6 +2862,9 @@ twentyc.editable.module.register(
       });
     },
     finalize_update_netixlan : async function(rowId, row, data) {
+      if (rowId !== data.id){
+        return;
+      }
       const ref_tag = $('[data-ref-tag]').data('ref-tag');
       if(ref_tag === "ix" || ref_tag === "net"){
         await this.waitForEdit();
@@ -4580,4 +4653,622 @@ $(function() {
 
   // Clean up the early injection
   $("#view-state").remove();
+});
+
+/**
+ * Generates API query code snippets for different programming languages.
+ *
+ * - Retrieves the current search query from the URL.
+ * - Constructs an API URL for the search query.
+ * - Generates code snippets for cURL, Python, JavaScript, Go, Ruby, and PHP.
+ * - Populates the corresponding HTML elements with generated snippets.
+ */
+function generateCodeSnippets() {
+  const currentUrl = new URL(window.location.href);
+  const searchQuery = currentUrl.searchParams.get('q');
+  const apiBaseUrl = `${window.location.origin}/api/search`;
+  const apiUrl = `${apiBaseUrl}?q=${encodeURIComponent(searchQuery)}`;
+
+  const snippets = {
+    curl: `curl -H "Authorization: api-key $YOUR_API_KEY" "${apiUrl}"`,
+
+    python:
+`import requests
+headers = {
+  "Authorization": f"api-key {YOUR_API_KEY}"
+}
+response = requests.get("${apiUrl}", headers=headers)
+response.raise_for_status()
+data = response.json()`,
+
+    js:
+`fetch("${apiUrl}", {
+headers: {
+    "Authorization": \`api-key \${YOUR_API_KEY}\`
+  }
+})
+.then(response => {
+if (!response.ok) {
+    throw new Error('Network response was not ok: ' + response.status);
+}
+return response.json();
+})
+.then(data => console.log(data))
+.catch(error => console.error('Error:', error));`,
+
+    go:
+`package main
+import (
+  "encoding/json"
+  "fmt"
+  "io"
+  "net/http"
+)
+func main() {
+  client := &http.Client{}
+  req, err := http.NewRequest("GET", "${apiUrl}", nil)
+  if err != nil {
+      panic(err)
+  }
+  req.Header.Add("Authorization", "api-key " + YOUR_API_KEY)
+  resp, err := client.Do(req)
+  if err != nil {
+      panic(err)
+  }
+  defer resp.Body.Close()
+
+  if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+      fmt.Printf("Request failed with status code: %d\\n", resp.StatusCode)
+      return
+  }
+
+  body, err := io.ReadAll(resp.Body)
+  if err != nil {
+      panic(err)
+  }
+
+  var data interface{}
+  if err := json.Unmarshal(body, &data); err != nil {
+      panic(err)
+  }
+  fmt.Println(data)
+}`,
+
+    ruby:
+`require 'net/http'
+require 'json'
+require 'uri'
+uri = URI('${apiUrl}')
+req = Net::HTTP::Get.new(uri)
+req['Authorization'] = "api-key #{YOUR_API_KEY}"
+response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == 'https') do |http|
+    http.request(req)
+end
+
+if response.is_a?(Net::HTTPSuccess)
+    data = JSON.parse(response.body)
+    puts data
+else
+    puts "Request failed with status: #{response.code}"
+    puts response.body
+end`,
+
+    php:
+`<?php
+$apiUrl = "${apiUrl}";
+$headers = array(
+    'Authorization: api-key ' . $YOUR_API_KEY
+);
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $apiUrl);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+$response = curl_exec($ch);
+$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+if ($httpCode >= 400) {
+    echo 'HTTP Error: ' . $httpCode . ' - ' . $response;
+} else {
+    $data = json_decode($response, true);
+    print_r($data);
+}
+curl_close($ch);
+?>`
+  };
+
+  document.getElementById('curl-output').textContent = snippets.curl;
+  document.getElementById('python-output').textContent = snippets.python;
+  document.getElementById('js-output').textContent = snippets.js;
+  document.getElementById('go-output').textContent = snippets.go;
+  document.getElementById('ruby-output').textContent = snippets.ruby;
+  document.getElementById('php-output').textContent = snippets.php;
+
+  initializeCopyButtons();
+}
+
+/**
+ * Initializes copy buttons for each code snippet.
+ *
+ * - Attaches event listeners to all elements with the `.copy-btn` class.
+ * - Retrieves the corresponding code snippet based on `data-code-id`.
+ * - Calls `copyToClipboard` when a button is clicked.
+ */
+function initializeCopyButtons() {
+  const copyButtons = document.querySelectorAll('.copy-btn');
+
+  copyButtons.forEach(button => {
+    const codeId = button.getAttribute('data-code-id');
+    let codeElement;
+
+    if (codeId === 'curl') {
+      codeElement = document.getElementById('curl-output');
+    } else if (codeId === 'python') {
+      codeElement = document.getElementById('python-output');
+    } else if (codeId === 'js') {
+      codeElement = document.getElementById('js-output');
+    } else if (codeId === 'go') {
+      codeElement = document.getElementById('go-output');
+    } else if (codeId === 'ruby') {
+      codeElement = document.getElementById('ruby-output');
+    } else if (codeId === 'php') {
+      codeElement = document.getElementById('php-output');
+    }
+
+    button.addEventListener('click', () => {
+      if (codeElement) {
+        copyToClipboard(codeElement.textContent, button);
+      }
+    });
+  });
+}
+
+/**
+ * Copies the provided text to the clipboard and provides visual feedback.
+ *
+ * - Uses `navigator.clipboard.writeText()` to copy the text.
+ * - Updates tooltip or button icon to indicate a successful copy.
+ * - Restores the original tooltip text or icon after a short delay.
+ *
+ * @param {string} text - The text to copy to the clipboard.
+ * @param {HTMLElement} button - The button that triggered the copy action.
+ */
+function copyToClipboard(text, button) {
+  navigator.clipboard.writeText(text)
+    .then(() => {
+      const tooltip = bootstrap.Tooltip.getInstance(button);
+
+      if (tooltip) {
+        const originalTitle = button.getAttribute('data-bs-original-title') || 'Copy to clipboard';
+
+        button.setAttribute('data-bs-original-title', 'Copied!');
+        tooltip.show();
+
+        setTimeout(() => {
+          button.setAttribute('data-bs-original-title', originalTitle);
+          tooltip.hide();
+        }, 1500);
+      } else {
+        const icon = button.querySelector('i');
+        const originalHtml = icon.innerHTML;
+        icon.innerHTML = 'check';
+
+        setTimeout(() => {
+          icon.innerHTML = originalHtml;
+        }, 1500);
+      }
+    })
+    .catch(err => {
+      console.error('Could not copy text: ', err);
+    });
+}
+
+/**
+ * Initializes event listeners for code snippet generation and tooltips.
+ *
+ * - Binds `generateCodeSnippets` to the "Copy API Query" button.
+ * - Initializes Bootstrap tooltips for elements with `data-bs-toggle="tooltip"`.
+ */
+function initializeCodeTabs() {
+  const queryBtn = document.getElementById('copy-api-query-btn');
+  if (queryBtn) {
+    queryBtn.addEventListener('click', generateCodeSnippets);
+  }
+
+  const codeSnippet = document.getElementById('codeTabsContent');
+  if (codeSnippet){
+    const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+    tooltipTriggerList.map(function (tooltipTriggerEl) {
+      return new bootstrap.Tooltip(tooltipTriggerEl);
+    });
+  }
+}
+
+document.addEventListener('DOMContentLoaded', initializeCodeTabs);
+
+/**
+ * Facility and Exchange Add Common Connections
+ * Handles adding networks, exchanges, and carriers to facilities/exchanges
+ */
+
+$(document).ready(function() {
+
+  /**
+   * Generic dropdown menu handler
+   * @param {string} btnSelector - Button selector (e.g., '#add-your-network-btn')
+   * @param {string} menuSelector - Menu selector (e.g., '#network-selection-menu')
+   * @param {string} itemSelector - Item selector (e.g., '.add-network-item')
+   * @param {number} itemCount - Number of items available
+   * @param {Object} singleItem - Single item data when count is 1
+   * @param {Function} onSelect - Callback when item is selected
+   */
+  function initializeDropdownHandler(btnSelector, menuSelector, itemSelector, itemCount, singleItem, onSelect) {
+    $(btnSelector).click(function(e) {
+      e.preventDefault();
+
+      if (itemCount > 1) {
+        var menu = $(menuSelector);
+        var btn = $(this);
+        var position = btn.position();
+
+        menu.css({
+          display: "block",
+          position: "absolute",
+          top: position.top + btn.outerHeight(),
+          left: position.left + btn.outerWidth(),
+          zIndex: 999
+        });
+
+        // Close the menu when clicking outside
+        $(document).one('click', function() {
+          menu.hide();
+        });
+
+        e.stopPropagation();
+        return false;
+      } else if (itemCount === 1) {
+        onSelect(singleItem.id, singleItem.name);
+      }
+    });
+
+    // Handle item selection from dropdown menu
+    $(itemSelector).click(function(e) {
+      e.preventDefault();
+      var id = $(this).data(getDataAttribute(itemSelector));
+      var name = $(this).data(getDataAttributeName(itemSelector));
+      onSelect(id, name);
+    });
+  }
+
+  /**
+   * Get the appropriate data attribute based on item selector
+   */
+  function getDataAttribute(itemSelector) {
+    if (itemSelector.includes('network')) return 'network-id';
+    if (itemSelector.includes('exchange')) return 'ix-id';
+    if (itemSelector.includes('carrier')) return 'carrier-id';
+    return 'id';
+  }
+
+  /**
+   * Get the appropriate data attribute name based on item selector
+   */
+  function getDataAttributeName(itemSelector) {
+    if (itemSelector.includes('network')) return 'network-name';
+    if (itemSelector.includes('exchange')) return 'ix-name';
+    if (itemSelector.includes('carrier')) return 'carrier-name';
+    return 'name';
+  }
+
+  /**
+   * Generic API request handler for creating relationships
+   * @param {string} endpoint - API endpoint (e.g., 'netfac', 'ixfac', 'carrierfac')
+   * @param {Object} data - Data to send to API
+   * @param {string} successMessage - Success message to display
+   * @param {string} errorMessage - Error message prefix
+   */
+  function createRelationship(endpoint, data, successMessage, errorMessage) {
+    PeeringDB.API.request(
+      "POST",
+      endpoint,
+      null,
+      data,
+      function(r) {
+        alert(successMessage);
+        location.reload();
+      }
+    ).fail(function(r) {
+      var errorMsg = errorMessage;
+      if (r.responseJSON && r.responseJSON.meta && r.responseJSON.meta.error) {
+        errorMsg = r.responseJSON.meta.error;
+      }
+      alert(errorMsg);
+    });
+  }
+
+  /**
+   * Generic confirmation and creation handler
+   * @param {number} id - Entity ID
+   * @param {string} name - Entity name
+   * @param {string} entityType - Type of entity (network, exchange, carrier)
+   * @param {number} facilityId - Facility ID
+   * @param {string} confirmMessage - Confirmation message template
+   */
+  function confirmAndCreate(id, name, entityType, facilityId, confirmMessage) {
+    if (confirm(confirmMessage.replace('{name}', name))) {
+      var endpoint, data, successMessage, errorMessage;
+
+      switch(entityType) {
+        case 'network':
+          endpoint = 'netfac';
+          data = { net_id: id, fac_id: facilityId };
+          successMessage = 'Network connection added successfully!';
+          errorMessage = 'Error creating network-facility link';
+          break;
+        case 'exchange':
+          endpoint = 'ixfac';
+          data = { ix_id: id, fac_id: facilityId };
+          successMessage = 'Exchange connection added successfully!';
+          errorMessage = 'Error creating exchange-facility link';
+          break;
+        case 'carrier':
+          endpoint = 'carrierfac';
+          data = { carrier_id: id, fac_id: facilityId };
+          successMessage = 'Carrier connection added successfully!';
+          errorMessage = 'Error creating carrier-facility link';
+          break;
+      }
+
+      createRelationship(endpoint, data, successMessage, errorMessage);
+    }
+  }
+
+  // Initialize facility network management
+  if (window.facilityNetworkConfig) {
+    var config = window.facilityNetworkConfig;
+    if (config.userNetworks.length > 0) {
+      initializeDropdownHandler(
+        '#add-your-network-btn',
+        '#network-selection-menu',
+        '.add-network-item',
+        config.userNetworks.length,
+        config.userNetworks[0],
+        function(networkId, networkName) {
+          confirmAndCreate(
+            networkId,
+            networkName,
+            'network',
+            config.facilityId,
+            "Are you sure you want to add '{name}' to this facility?"
+          );
+        }
+      );
+    }
+  }
+
+  // Initialize facility exchange management
+  if (window.facilityExchangeConfig) {
+    var config = window.facilityExchangeConfig;
+    if (config.userExchanges.length > 0) {
+      initializeDropdownHandler(
+        '#add-your-exchange-btn',
+        '#exchange-selection-menu',
+        '.add-exchange-item',
+        config.userExchanges.length,
+        config.userExchanges[0],
+        function(exchangeId, exchangeName) {
+          confirmAndCreate(
+            exchangeId,
+            exchangeName,
+            'exchange',
+            config.facilityId,
+            "Are you sure you want to add '{name}' to this facility?"
+          );
+        }
+      );
+    }
+  }
+
+  // Initialize facility carrier management
+  if (window.facilityCarrierConfig) {
+    var config = window.facilityCarrierConfig;
+    if (config.userCarriers.length > 0) {
+      initializeDropdownHandler(
+        '#add-your-carrier-btn',
+        '#carrier-selection-menu',
+        '.add-carrier-item',
+        config.userCarriers.length,
+        config.userCarriers[0],
+        function(carrierId, carrierName) {
+          confirmAndCreate(
+            carrierId,
+            carrierName,
+            'carrier',
+            config.facilityId,
+            "Are you sure you want to add '{name}' to this facility?"
+          );
+        }
+      );
+    }
+  }
+
+  // Initialize exchange network management (netixlan)
+  if (window.exchangeNetworkConfig) {
+    var config = window.exchangeNetworkConfig;
+    if (config.userNetworks.length > 0) {
+      initializeNetixlanManagement(config);
+    }
+  }
+
+  /**
+   * Initialize add netixlan management
+   */
+  function initializeNetixlanManagement(config) {
+
+    /**
+     * Display inline field errors and general error messages
+     */
+    function renderErrors(fieldErrors, generalMessage) {
+      clearErrors();
+
+      var errorContainer = $("#error-container");
+      var generalErrors = [];
+
+      if (generalMessage) {
+        generalErrors.push(generalMessage);
+      }
+
+      if (fieldErrors && fieldErrors.non_field_errors && Array.isArray(fieldErrors.non_field_errors)) {
+        generalErrors = generalErrors.concat(fieldErrors.non_field_errors);
+      }
+
+      if (generalErrors.length > 0) {
+        errorContainer.text(generalErrors.join("\n")).show();
+      }
+
+      if (fieldErrors) {
+        $.each(fieldErrors, function(field, errors) {
+          if (field === "meta" || field === "non_field_errors") return;
+
+          var msg = errors;
+          if (Array.isArray(errors)) {
+            msg = errors.join(", ");
+          }
+
+          var fieldMap = {
+            "ipaddr4": "ipv4",
+            "ipaddr6": "ipv6",
+            "speed": "speed",
+            "net_id": "network-id",
+            "ixlan_id": "ixlan-id",
+            "is_rs_peer": "rs-peer",
+            "bfd_support": "bfd-support",
+            "operational": "operational"
+          };
+
+          var fieldId = fieldMap[field] || field;
+          var element = $("#netixlan-" + fieldId);
+
+          if (element.length) {
+            element.addClass("is-invalid");
+            $("<div>")
+              .addClass("invalid-feedback")
+              .text(msg)
+              .insertAfter(element);
+          }
+        });
+      }
+    }
+
+    /**
+     * Clear all error messages and validation states
+     */
+    function clearErrors() {
+      $(".invalid-feedback").remove();
+      $(".is-invalid").removeClass("is-invalid");
+      $("#error-container").hide().empty();
+    }
+
+    /**
+     * Open the netixlan modal
+     */
+    function openNetixlanModal(networkId, networkName) {
+      $("#netixlan-network-id").val(networkId);
+      $("#add-netixlan-modal-label").text("Add " + networkName + " to Exchange Point");
+      $("#add-netixlan-modal").modal("show");
+    }
+
+    // Initialize dropdown handler for network selection
+    initializeDropdownHandler(
+      '#add-your-network-btn',
+      '#network-selection-menu',
+      '.add-network-item',
+      config.userNetworks.length,
+      config.userNetworks[0],
+      openNetixlanModal
+    );
+
+    // Reset form when modal is opened
+    $("#add-netixlan-modal").on("show.bs.modal", function() {
+      clearErrors();
+      $("#netixlan-ipv4, #netixlan-ipv6").val("");
+      $("#netixlan-speed").val("");
+      $("#netixlan-rs-peer, #netixlan-bfd-support").prop("checked", false);
+      $("#netixlan-operational").prop("checked", true);
+    });
+
+    // Handle form submission
+    $("#add-netixlan-submit").click(function() {
+      clearErrors();
+
+      var formData = $("#add-netixlan-form").serializeArray();
+      var data = {};
+
+      // Convert form data to object
+      $.each(formData, function(i, field) {
+        data[field.name] = field.value;
+      });
+
+      // Add checkbox values
+      data.is_rs_peer = $("#netixlan-rs-peer").prop("checked") ? 1 : 0;
+      data.bfd_support = $("#netixlan-bfd-support").prop("checked") ? 1 : 0;
+      data.operational = $("#netixlan-operational").prop("checked") ? 1 : 0;
+
+      // Client-side validation
+      var hasErrors = false;
+
+      if (!data.ipaddr4 && !data.ipaddr6) {
+        $("#netixlan-ipv4, #netixlan-ipv6").addClass("is-invalid");
+        $("<div>")
+          .addClass("invalid-feedback")
+          .text("At least one IP address (IPv4 or IPv6) is required")
+          .insertAfter($("#netixlan-ipv6"));
+        hasErrors = true;
+      }
+
+      if (!data.speed) {
+        data.speed = 0;
+      }
+
+      data.net_id = parseInt(data.net_id);
+
+      if (!data.net_id) {
+        $("#error-container").text("Network ID is required").show();
+        hasErrors = true;
+      }
+
+      if (hasErrors) {
+        return;
+      }
+
+      var submitBtn = $("#add-netixlan-submit");
+      var originalText = submitBtn.text();
+      submitBtn.prop("disabled", true).text("Processing...");
+
+      PeeringDB.API.request(
+        "POST",
+        "netixlan",
+        null,
+        data,
+        function(r) {
+          $("#add-netixlan-modal").modal("hide");
+          alert("Network connection added successfully!");
+          location.reload();
+        }
+      ).fail(function(xhr) {
+        var errorMsg = "Error adding network-exchange connection";
+        var fieldErrors = {};
+
+        if (xhr.responseJSON) {
+          fieldErrors = xhr.responseJSON;
+          if (xhr.responseJSON.meta && xhr.responseJSON.meta.error) {
+            errorMsg = xhr.responseJSON.meta.error;
+          }
+        }
+
+        console.log("Error response:", xhr.responseJSON);
+        renderErrors(fieldErrors, errorMsg);
+      }).always(function() {
+        submitBtn.prop("disabled", false).text(originalText);
+      });
+    });
+  }
 });

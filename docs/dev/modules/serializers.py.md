@@ -1,4 +1,4 @@
-Generated from serializers.py on 2025-02-11 10:26:48.481231
+Generated from serializers.py on 2025-07-21 14:23:08.671110
 
 # peeringdb_server.serializers
 
@@ -339,6 +339,15 @@ Possible relationship queries:
   - ix_id, handled by serializer
 
 
+### Methods
+
+#### to_representation
+`def to_representation(self, instance)`
+
+Object instance -> Dict of primitive datatypes.
+
+---
+
 ## InternetExchangeFacilitySerializer
 
 ```
@@ -595,20 +604,6 @@ Possible relationship queries:
   - net_id, handled by seralizers
 
 
-### Methods
-
-#### run_validation
-`def run_validation(self, data=<class 'rest_framework.fields.empty'>)`
-
-Custom validation handling.
-
-Will run the vanilla django-rest-framework validation but
-wrap it with logic to handle unique constraint errors to
-restore soft-deleted objects that are blocking a save on basis
-of a unique constraint violation.
-
----
-
 ## NetworkIXLanSerializer
 
 ```
@@ -719,6 +714,24 @@ Object instance -> Dict of primitive datatypes.
 
 ---
 
+## NullableIntegerField
+
+```
+NullableIntegerField(rest_framework.fields.IntegerField)
+```
+
+Integer field that handles null values.
+
+
+### Methods
+
+#### to_internal_value
+`def to_internal_value(self, data)`
+
+Transform the *incoming* primitive data into a native value.
+
+---
+
 ## OrganizationSerializer
 
 ```
@@ -795,25 +808,6 @@ Initialize self.  See help(type(self)) for accurate signature.
 
 ---
 
-## SaneIntegerField
-
-```
-SaneIntegerField(rest_framework.fields.IntegerField)
-```
-
-Integer field that renders null values to 0.
-
-
-### Methods
-
-#### get_attribute
-`def get_attribute(self, instance)`
-
-Given the *outgoing* object instance, return the primitive value
-that should be used for this field.
-
----
-
 ## SocialMediaSerializer
 
 ```
@@ -880,5 +874,23 @@ Order of operations:
 2. retrieve the city bounding box via google geocode
 3. set distance on the filters based on the bounding box, turning
       the query into a spatial distance search.
+
+---
+
+## UserSerializer
+
+```
+UserSerializer(peeringdb_server.serializers.ModelSerializer)
+```
+
+Serializer for peeringdb_server.models.User
+
+
+### Methods
+
+#### to_representation
+`def to_representation(self, instance)`
+
+Object instance -> Dict of primitive datatypes.
 
 ---

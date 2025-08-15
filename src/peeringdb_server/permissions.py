@@ -16,15 +16,22 @@ Censor API output data according to permissions using grainy Applicators.
 import grainy.const as grainy_constant
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
-from django_grainy.helpers import request_method_to_flag
 
 # from django_grainy.const import *
+from django_grainy.helpers import request_method_to_flag
 from django_grainy.util import Permissions
 from grainy.core import NamespaceKeyApplicator
 from rest_framework.permissions import BasePermission
 from rest_framework_api_key.permissions import KeyParser
 
-from peeringdb_server.models import Group, OrganizationAPIKey, User, UserAPIKey
+from peeringdb_server.models import (
+    Group,
+    Organization,
+    OrganizationAPIKey,
+    OrganizationAPIPermission,
+    User,
+    UserAPIKey,
+)
 
 
 def validate_rdap_user_or_key(request, rdap):
@@ -297,3 +304,22 @@ class APIPermissionsApplicator(NamespaceKeyApplicator):
             perms = self.permissions.check(_namespace, 0x01, explicit=True)
             if not perms:
                 del data["ixf_ixp_member_list_url"]
+
+            # Issue #1730: When retrieving only the 'ixf_ixp_member_list_url' field using
+            # ?fields=ixf_ixp_member_list_url, an error occurs because this field requires
+            # 'ixf_ixp_member_list_url_visible' to also be present.
+            #
+            # Solution: We added 'ixf_ixp_member_list_url_visible' in the serializer to make
+            # the permission check pass. Then we check if only these two specific fields are
+            # present in the data (ignoring the "_grainy" key added by the model serializer).
+            #
+            # If that's the case, we remove 'ixf_ixp_member_list_url_visible' since it wasn't
+            # explicitly requested by the user.
+            ignored_keys = {"_grainy"}
+            remaining_keys = set(data.keys()) - ignored_keys
+            # Only check if 'ixf_ixp_member_list_url' and 'ixf_ixp_member_list_url_visible' present
+            if remaining_keys == {
+                "ixf_ixp_member_list_url",
+                "ixf_ixp_member_list_url_visible",
+            }:
+                del data["ixf_ixp_member_list_url_visible"]

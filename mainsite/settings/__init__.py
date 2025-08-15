@@ -2,6 +2,7 @@
 
 import os
 import sys
+from datetime import datetime
 
 import django.conf.global_settings
 import django.conf.locale
@@ -396,6 +397,8 @@ set_option("API_THROTTLE_RATE_ANON", "100/second")
 set_option("API_THROTTLE_RATE_USER", "100/second")
 set_option("API_THROTTLE_RATE_FILTER_DISTANCE", "10/minute")
 set_option("API_THROTTLE_IXF_IMPORT", "1/minute")
+set_option("API_THROTTLE_ORGANIZATION_USERS", "1/second")
+
 
 # Configuration for melissa request rate limiting in the api (#1124)
 
@@ -523,6 +526,10 @@ set_option("POC_DELETION_PERIOD", 30)
 # Sets maximum age for a user-request in the verification queue
 # Otherwise we delete with the pdb_cleanup_vq tool
 set_option("VQUEUE_USER_MAX_AGE", 90)
+
+set_option("VQUEUE_IX_MAX_AGE", 90)
+
+set_option("VQUEUE_FAC_MAX_AGE", 90)
 
 # NEGATIVE CACHE
 
@@ -793,6 +800,7 @@ _TEMPLATE_CONTEXT_PROCESSORS = (
     "django.template.context_processors.tz",
     "django.contrib.messages.context_processors.messages",
     "peeringdb_server.context_processors.theme_mode",
+    "peeringdb_server.context_processors.ui_version",
 )
 
 _TEMPLATE_DIRS = (os.path.join(BASE_DIR, "peeringdb_server", "templates"),)
@@ -874,9 +882,6 @@ PASSWORD_HASHERS = (
     "django.contrib.auth.hashers.SHA1PasswordHasher",
     "django.contrib.auth.hashers.MD5PasswordHasher",
     "django.contrib.auth.hashers.CryptPasswordHasher",
-    "hashers_passlib.md5_crypt",
-    "hashers_passlib.des_crypt",
-    "hashers_passlib.bsdi_crypt",
 )
 
 ROOT_URLCONF = "mainsite.urls"
@@ -966,6 +971,7 @@ MIDDLEWARE += (
     "peeringdb_server.middleware.CurrentRequestContext",
     "peeringdb_server.middleware.PDBCommonMiddleware",
     "peeringdb_server.middleware.PDBPermissionMiddleware",
+    "peeringdb_server.middleware.EnforceMFAMiddleware",
     "oauth2_provider.middleware.OAuth2TokenMiddleware",
     "django_structlog.middlewares.RequestMiddleware",
 )
@@ -1088,6 +1094,7 @@ if API_THROTTLE_ENABLED:
                 "melissa_ip": API_THROTTLE_MELISSA_RATE_IP,
                 "melissa_admin": API_THROTTLE_MELISSA_RATE_ADMIN,
                 "write_api": API_THROTTLE_RATE_WRITE,
+                "organization_users_ops": API_THROTTLE_ORGANIZATION_USERS,
             },
         }
     )
@@ -1122,6 +1129,9 @@ set_option("SEARCH_RESULTS_AUTOCOMPLETE_LIMIT", 40)
 # boost org,net,fac,ix matches over secondary entites (1.0 == no boost)
 set_option("SEARCH_MAIN_ENTITY_BOOST", 1.5)
 
+# ASN connectivity advanced search limit
+set_option("ASN_CONNECTIVITY_LIMIT", 10)
+
 
 set_option("BASE_URL", "http://localhost")
 set_option("PASSWORD_RESET_URL", os.path.join(BASE_URL, "reset-password"))
@@ -1131,7 +1141,6 @@ set_option("MAX_LENGTH_PASSWORD", 1024)
 
 ACCOUNT_EMAIL_CONFIRMATION_ANONYMOUS_REDIRECT_URL = "/login"
 ACCOUNT_EMAIL_CONFIRMATION_AUTHENTICATED_REDIRECT_URL = "/verify"
-ACCOUNT_EMAIL_REQUIRED = True
 
 # Webauthn (U2F) settings
 
@@ -1499,6 +1508,24 @@ set_option("PERIODIC_REAUTH_ENABLED", True)
 # Maximum amount of email addresses allowed per user
 set_option("USER_MAX_EMAIL_ADDRESSES", 5)
 
+# User option flag to hide IXs without a linked facility
+set_option("OPTFLAG_HIDE_IX_WITHOUT_FAC", 1)
+
+# Default UI Version for unauthenticated users
+set_option("DEFAULT_UI_NEXT_ENABLED", False)
+
+# User option flag to enable UI NEXT
+set_option("USER_OPT_FLAG_UI_NEXT", 0x02)
+
+# User option flag to enable UI NEXT
+set_option("USER_OPT_FLAG_UI_NEXT_REJECTED", 0x04)
+
+# User option flag to mfa notification
+set_option("USER_OPT_FLAG_NOTIFIED_MFA", 0x08)
+
+# User option flag to api keys notification
+set_option("USER_OPT_FLAG_NOTIFIED_API_KEY", 0x10)
+
 # Authentication settings to use when syncing via pdb_load
 set_option("PEERINGDB_SYNC_USERNAME", "")
 set_option("PEERINGDB_SYNC_PASSWORD", "")
@@ -1530,5 +1557,19 @@ set_option(
         "VA",  # Vatican City
     ],
 )
+
+# Date when MFA setup will be requested for new users.
+set_option("MFA_FORCE_SOFT_START", None, envvar_type=str)
+
+# if set convert to datetime off of YYYY-MM-DD
+if MFA_FORCE_SOFT_START:
+    MFA_FORCE_SOFT_START = datetime.strptime(MFA_FORCE_SOFT_START, "%Y-%m-%d")
+
+# Date when MFA will be enforced for all users.
+set_option("MFA_FORCE_HARD_START", None, envvar_type=str)
+
+# if set convert to datetime off of YYYY-MM-DD
+if MFA_FORCE_HARD_START:
+    MFA_FORCE_HARD_START = datetime.strptime(MFA_FORCE_HARD_START, "%Y-%m-%d")
 
 print_debug(f"loaded settings for PeeringDB {PEERINGDB_VERSION} (DEBUG: {DEBUG})")

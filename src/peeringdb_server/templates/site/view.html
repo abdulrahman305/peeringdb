@@ -225,7 +225,30 @@
       <div class="col-4 text-right">
         <a class="btn btn-success suggestion-dismiss">{% trans "Dismiss" %}</a>
         <a class="btn btn-success suggestion-accept">{% trans "Accept" %}</a>
+        <a class="btn btn-danger suggestion-report"
+            href="mailto:{{ email }}?subject=Address Normalization Issue"
+            target="_blank">
+            {% trans "Report Issue" %}
+        </a>
       </div>
+    </div>
+  </div>
+
+  <div data-edit-geotag="{{ref_tag}}"
+     class="editable popin alert alert-info normalized-address marg-top-15 marg-bot-15 hidden">
+    <div class="row">
+        <div class="col-8">
+            <p>{% trans "Your address was automatically normalized to the following:" %}</p>
+            <div class="normalized-fields"></div>
+        </div>
+        <div class="col-4 text-right">
+            <a class="btn btn-success normalization-acknowledge">{% trans "OK" %}</a>
+            <a class="btn btn-danger normalization-report"
+               href="mailto:{{ email }}?subject=Address Normalization Issue"
+               target="_blank">
+                {% trans "Report Issue" %}
+            </a>
+        </div>
     </div>
   </div>
 
@@ -673,17 +696,16 @@ $(document).ready(function() {
     }
   })
 
-  $('[data-bs-toggle="tooltip"]').tooltip({container:"body", trigger:"hover"});
 
 });
 </script>
-{% else %}
+{% endif %}
+
 <script>
   $(document).ready(function(){
-    $('[data-bs-toggle="tooltip"][data-tooltip-show="always"]').tooltip({container:"body", trigger:"hover"});
+    $('[data-bs-toggle="tooltip"]').tooltip({container:"body", trigger:"hover"});
   })
 </script>
-{% endif %}
 
 {% if ref_tag != "org" and  ref_tag != "campus" %}
 <!-- EXPORT FORM LOGIC -->

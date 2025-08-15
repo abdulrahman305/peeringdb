@@ -1,4 +1,4 @@
-Generated from admin.py on 2025-02-11 10:26:51.333315
+Generated from admin.py on 2025-07-21 14:23:09.006993
 
 # peeringdb_server.admin
 
@@ -790,6 +790,27 @@ These attributes / properties will be available on instances of the class
 
 - media (`@property`): None
 
+### Methods
+
+#### change_view
+`def change_view(self, request, object_id, form_url=, extra_context=None)`
+
+Show message to the admin page if the prefix is not deletable
+
+---
+#### delete_model
+`def delete_model(self, request, obj)`
+
+Check the deletable property
+
+---
+#### delete_view
+`def delete_view(self, request, object_id, extra_context=None)`
+
+Custom delete view to check deletable property before confirming deletion
+
+---
+
 ## IXLanPrefixForm
 
 ```
@@ -1399,6 +1420,21 @@ request has permission to delete *any* object of the given type.
 
 ---
 
+## SearchLogAdmin
+
+```
+SearchLogAdmin(django.contrib.admin.options.ModelAdmin)
+```
+
+Encapsulate all admin options and functionality for a given model.
+
+
+### Instanced Attributes
+
+These attributes / properties will be available on instances of the class
+
+- media (`@property`): None
+
 ## SoftDeleteAdmin
 
 ```
@@ -1812,7 +1848,7 @@ association with the field named '__all__'.
 UserPermission(peeringdb_server.models.User)
 ```
 
-UserPermission(id, password, last_login, is_superuser, username, email, first_name, last_name, is_staff, is_active, date_joined, created, updated, status, primary_org, locale, flagged_for_deletion, notified_for_deletion, never_flag_for_deletion)
+UserPermission(id, password, last_login, is_superuser, username, email, first_name, last_name, is_staff, is_active, date_joined, created, updated, status, primary_org, locale, flagged_for_deletion, notified_for_deletion, never_flag_for_deletion, opt_flags)
 
 
 ## UserPermissionAdmin

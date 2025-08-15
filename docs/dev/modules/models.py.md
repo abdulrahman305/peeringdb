@@ -1,4 +1,4 @@
-Generated from models.py on 2025-02-11 10:26:48.481231
+Generated from models.py on 2025-07-21 14:23:08.671110
 
 # peeringdb_server.models
 
@@ -635,8 +635,14 @@ We do this by checking if the IX-F data was provided
 or not.
 - modify_is_rs_peer (`@property`): Returns whether or not the `is_rs_peer` property
 is enabled to receive modify updates or not (#793).
+
+Will return True if the related network has `allow_ixp_update` set to True.
+Otherwise returns False (#1614).
 - modify_speed (`@property`): Returns whether or not the `speed` property
 is enabled to receive modify updates or not (#793).
+
+Will return True if the related network has `allow_ixp_update` set to True.
+Otherwise returns False (#1614).
 - net (`@property`): Returns the Network instance related to
 this entry.
 - net_contacts (`@property`): Returns a list of email addresses that
@@ -1063,6 +1069,9 @@ Descries a Prefix at an Exchange LAN.
 
 These attributes / properties will be available on instances of the class
 
+- deletable (`@property`): Returns whether or not the prefix is currently
+in a state where it can be marked as deleted.
+This will be False if there are netixlans using IPs from this prefix.
 - descriptive_name (`@property`): Returns a descriptive label of the ixpfx for logging purposes.
 - grainy_namespace (`@property`): None
 - ix_id (`@property`): None
@@ -1590,6 +1599,7 @@ These attributes / properties will be available on instances of the class
 
 - descriptive_name (`@property`): Returns a descriptive label of the netfac for logging purposes.
 - grainy_namespace (`@property`): None
+- local_asn (`@property`): Read-only property that returns the ASN of the parent network.
 
 ### Class Methods
 
@@ -1623,15 +1633,6 @@ Relationship through facility.
 
 ### Methods
 
-#### clean
-`def clean(self)`
-
-Hook for doing any extra model-wide validation after clean() has been
-called on every field by self.clean_fields. Any ValidationError raised
-by this method will not be associated with a particular field; it will
-have a special-case association with the field defined by NON_FIELD_ERRORS.
-
----
 #### save
 `def save(self, *args, **kwargs)`
 
@@ -2121,6 +2122,15 @@ Override this in the class that uses this mixin (if needed).
 
 ---
 
+## SearchLog
+
+```
+SearchLog(peeringdb_server.models.StripFieldMixin)
+```
+
+Rudimentary logging of search queries.
+
+
 ## SocialMediaMixin
 
 ```
@@ -2280,13 +2290,16 @@ These attributes / properties will be available on instances of the class
 - affiliation_requests_available (`@property`): Returns whether the user currently has any affiliation request
 slots available by checking that the number of pending affiliation requests
 the user has is lower than MAX_USER_AFFILIATION_REQUESTS
+- carriers (`@property`): Returns all carriers this user is a member of.
 - email_confirmed (`@property`): Returns True if the email specified by the user has
 been confirmed, False if not.
+- exchanges (`@property`): Returns all exchanges this user is a member of.
 - full_name (`@property`): None
 - get_2fa_security_keys (`@property`): None
 - get_passkey_security_keys (`@property`): None
 - has_2fa (`@property`): Returns true if the user has set up any TOTP or webauth security keys.
 - has_oauth (`@property`): None
+- hide_ixs_without_fac (`@property`): Returns whether user has enabled hiding IXs without facilities
 - is_verified_user (`@property`): Returns whether the user is verified (e.g., has been validated
 by PDB staff).
 
@@ -2297,6 +2310,10 @@ has been added to the 'user' user group.
 - pending_affiliation_requests (`@property`): Returns the currently pending user -> org affiliation
 requests for this user.
 - self_entity_org (`@property`): None
+- ui_next_enabled (`@property`): None
+- ui_next_rejected (`@property`): None
+- was_notified_api_key (`@property`): None
+- was_notified_mfa (`@property`): None
 
 ### Methods
 
@@ -2394,6 +2411,12 @@ confirm that the email they provided is theirs.
 `def set_locale(self, locale)`
 
 Returns user preferred language.
+
+---
+#### set_opt_flag
+`def set_opt_flag(self, flag, value=True)`
+
+Set user option flags.
 
 ---
 #### set_unverified

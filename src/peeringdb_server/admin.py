@@ -34,7 +34,7 @@ from django.db import models, transaction
 from django.db.models import Q
 from django.db.utils import OperationalError
 from django.forms import DecimalField
-from django.http import HttpResponseForbidden, JsonResponse
+from django.http import HttpResponseForbidden, HttpResponseRedirect, JsonResponse
 from django.shortcuts import redirect
 from django.template import loader
 from django.template.response import TemplateResponse
@@ -96,6 +96,7 @@ from peeringdb_server.models import (
     OrganizationMergeEntity,
     Partnership,
     ProtectedAction,
+    SearchLog,
     Sponsorship,
     SponsorshipOrganization,
     User,
@@ -263,6 +264,8 @@ def merge_organizations(targets, target, request):
 
     # preare stats
 
+    campus_moved = 0
+    carrier_moved = 0
     ix_moved = 0
     fac_moved = 0
     net_moved = 0
@@ -304,6 +307,16 @@ def merge_organizations(targets, target, request):
             fac.save()
             merge.log_entity(fac)
             fac_moved += 1
+        for carrier in org.carrier_set.all():
+            carrier.org = target
+            carrier.save()
+            merge.log_entity(carrier)
+            carrier_moved += 1
+        for campus in org.campus_set.all():
+            campus.org = target
+            campus.save()
+            merge.log_entity(campus)
+            campus_moved += 1
 
         # move users
         for user in org.usergroup.user_set.all():
@@ -338,6 +351,8 @@ def merge_organizations(targets, target, request):
         mail_sponsorship_admin_merge(sponsorship_moved[0], target)
 
     return {
+        "campus": campus_moved,
+        "carier": carrier_moved,
         "ix": ix_moved,
         "fac": fac_moved,
         "net": net_moved,
@@ -451,6 +466,15 @@ def soft_delete(modeladmin, request, queryset):
             return
 
         for row in queryset:
+            if isinstance(row, IXLanPrefix) and not row.deletable:
+                messages.error(
+                    request,
+                    _("Protected object '{}': {}").format(
+                        row, row.not_deletable_reason
+                    ),
+                )
+                continue
+
             try:
                 row.delete()
             except ProtectedAction as err:
@@ -1660,6 +1684,34 @@ class IXLanPrefixAdmin(SoftDeleteAdmin, ISODateTimeMixin):
     def ix(self, obj):
         return obj.ixlan.ix
 
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        """
+        Show message to the admin page if the prefix is not deletable
+        """
+        obj = self.get_object(request, object_id)
+        response = super().change_view(request, object_id, form_url, extra_context)
+
+        if obj and not obj.deletable:
+            messages.warning(request, f"⚠️ {obj.not_deletable_reason}")
+
+        return response
+
+    def delete_model(self, request, obj):
+        """Check the deletable property"""
+        if not obj.deletable:
+            messages.error(request, obj.not_deletable_reason)
+            return
+        obj.delete()
+
+    def delete_view(self, request, object_id, extra_context=None):
+        """Custom delete view to check deletable property before confirming deletion"""
+        obj = self.get_object(request, object_id)
+        if obj and not obj.deletable:
+            messages.error(request, obj.not_deletable_reason)
+            # Redirect back to the changelist page
+            return HttpResponseRedirect("../")
+        return super().delete_view(request, object_id, extra_context)
+
 
 class NetworkIXLanAdminForm(StatusForm):
     net_side = baseForms.ChoiceField(required=False)
@@ -1767,7 +1819,7 @@ class NetworkContactAdmin(SoftDeleteAdmin, ISODateTimeMixin):
 class NetworkFacilityAdmin(SoftDeleteAdmin, ISODateTimeMixin):
     list_display = ("id", "net", "facility", "status", "iso_created", "iso_updated")
     search_fields = ("network__asn", "network__name", "facility__name")
-    readonly_fields = ("id", "net")
+    readonly_fields = ("id", "net", "local_asn")
     list_filter = (StatusFilter,)
     form = StatusForm
 
@@ -2869,6 +2921,13 @@ class TOTPDeviceAdminCustom(TOTPDeviceAdmin):
 
     get_username.admin_order_field = "user__username"
     get_username.short_description = "user"
+
+
+@admin.register(SearchLog)
+class SearchLogAdmin(admin.ModelAdmin):
+    list_display = ["id", "query", "authenticated", "created", "version"]
+    search_fields = ["query"]
+    list_filter = ["authenticated", "version"]
 
 
 admin.site.unregister(TOTPDevice)

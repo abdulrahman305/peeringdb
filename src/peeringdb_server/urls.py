@@ -14,6 +14,7 @@ import peeringdb_server.data_views
 import peeringdb_server.org_admin_views
 import peeringdb_server.rest
 from peeringdb_server.autocomplete_views import (
+    ASNAutocomplete,
     DeletedVersionAutocomplete,
     ExchangeAutocomplete,
     ExchangeAutocompleteJSON,
@@ -70,6 +71,8 @@ from peeringdb_server.views import (
     resend_confirmation_mail,
     search_elasticsearch,
     unwatch_network,
+    update_ui_versions,
+    update_user_options,
     validator_result_cache,
     view_about,
     view_advanced_search,
@@ -143,7 +146,7 @@ urlpatterns = [
     re_path(r"^verify$", view_verify),
     re_path(r"^profile$", view_profile, name="user-profile"),
     re_path(r"^profile/close$", view_close_account, name="close-account"),
-    re_path(r"^profile/v1$", view_profile_v1),
+    re_path(r"^profile/v1$", view_profile_v1, name="profile-v1"),
     re_path(r"^profile/email/add", profile_add_email, name="profile-add-email"),
     re_path(
         r"^profile/email/delete", profile_delete_email, name="profile-remove-email"
@@ -153,6 +156,8 @@ urlpatterns = [
         profile_set_primary_email,
         name="profile-set-primary-email",
     ),
+    re_path(r"^profile/options$", update_user_options, name="user-update-options"),
+    re_path(r"^profile/ui-versions$", update_ui_versions, name="update-ui-versions"),
     re_path(r"^resend_email_confirmation$", resend_confirmation_mail),
     re_path(r"^sponsors$", view_sponsorships, name="sponsors"),
     # re_path(r'^partners$', view_partnerships),
@@ -237,6 +242,10 @@ urlpatterns = [
     re_path(
         r"^security_keys/verify_authentication$",
         security_keys_views.verify_authentication,
+    ),
+    re_path(
+        r"^security_keys/update-security-key$",
+        security_keys_views.update_security_key,
     ),
     re_path(r"^security_keys/add$", security_keys_views.register_security_key),
     re_path(r"^security_keys/remove$", security_keys_views.remove_security_key),
@@ -432,6 +441,7 @@ urlpatterns += [
     re_path(
         r"^autocomplete/net$", NetworkAutocomplete.as_view(), name="autocomplete-net"
     ),
+    re_path(r"^autocomplete/asn$", ASNAutocomplete.as_view(), name="autocomplete-asn"),
     re_path(
         r"^autocomplete/ixlan/$", IXLanAutocomplete.as_view(), name="autocomplete-ixlan"
     ),
